@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/sagernet/sing-vmess/vless/encryption"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -72,10 +73,22 @@ func NewVisionConn(conn net.Conn, tlsConn net.Conn, userUUID [16]byte, logger lo
 		reflectPointer uintptr
 		netConn        net.Conn
 	)
-	for _, tlsCreator := range tlsRegistry {
-		loaded, netConn, reflectType, reflectPointer = tlsCreator(tlsConn)
-		if loaded {
-			break
+	if encryptedConn, isEncryptedConn := common.Cast[*encryption.CommonConn](conn); isEncryptedConn {
+		logger.Trace("encrypted connection")
+		loaded = true
+		reflectType = reflect.TypeOf(encryptedConn).Elem()
+		reflectPointer = uintptr(unsafe.Pointer(encryptedConn))
+		netConn = encryptedConn.Upstream().(net.Conn)
+		if xorConn, isXorConn := netConn.(*encryption.XorConn); isXorConn {
+			logger.Trace("xor connection")
+			netConn = xorConn
+		}
+	} else {
+		for _, tlsCreator := range tlsRegistry {
+			loaded, netConn, reflectType, reflectPointer = tlsCreator(tlsConn)
+			if loaded {
+				break
+			}
 		}
 	}
 	if !loaded {
