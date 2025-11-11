@@ -1,6 +1,7 @@
 package vless
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -27,7 +28,7 @@ type Client struct {
 	encryption *encryption.Client
 }
 
-func NewClient(userId string, flow string, encryptionOptions string, logger logger.Logger) (*Client, error) {
+func NewClient(ctx context.Context, userId string, flow string, encryptionOptions string, logger logger.Logger) (*Client, error) {
 	user, err := uuid.FromString(userId)
 	if err != nil {
 		user = uuid.NewV5(uuid.Nil, userId)
@@ -45,7 +46,7 @@ func NewClient(userId string, flow string, encryptionOptions string, logger logg
 		if err != nil {
 			return nil, err
 		}
-		encryptionClient, err = encryption.NewClient(nfsPKeysBytes, xorMode, seconds, padding)
+		encryptionClient, err = encryption.NewClient(ctx, nfsPKeysBytes, xorMode, seconds, padding)
 		if err != nil {
 			return nil, err
 		}

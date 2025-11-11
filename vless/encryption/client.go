@@ -1,6 +1,8 @@
 package encryption
 
 import (
+	"bytes"
+	"context"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/mlkem"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/ntp"
 
 	"lukechampine.com/blake3"
 )
@@ -49,13 +52,14 @@ type Client struct {
 	PaddingLens   [][3]int
 	PaddingGaps   [][3]int
 
-	RWLock sync.RWMutex
-	Expire time.Time
-	PfsKey []byte
-	Ticket []byte
+	RWLock   sync.RWMutex
+	timeFunc func() time.Time
+	Expire   time.Time
+	PfsKey   []byte
+	Ticket   []byte
 }
 
-func NewClient(nfsPKeysBytes [][]byte, xorMode XorMode, seconds uint32, padding string) (client *Client, err error) {
+func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, seconds uint32, padding string) (client *Client, err error) {
 	if len(nfsPKeysBytes) == 0 {
 		return nil, E.New("empty nfsPKeysBytes")
 	}
@@ -65,6 +69,10 @@ func NewClient(nfsPKeysBytes [][]byte, xorMode XorMode, seconds uint32, padding 
 		Hash32s:       make([][Hash256Length]byte, len(nfsPKeysBytes)),
 		XorMode:       xorMode,
 		Seconds:       seconds,
+		timeFunc:      ntp.TimeFuncFromContext(ctx),
+	}
+	if client.timeFunc == nil {
+		client.timeFunc = time.Now
 	}
 	for j, k := range nfsPKeysBytes {
 		if len(k) == X25519KeySize {
@@ -199,13 +207,13 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 
 	if c.Seconds > 0 {
 		c.RWLock.RLock()
-		if time.Now().Before(c.Expire) {
+		if c.timeFunc().Before(c.Expire) {
 			commonConn.Client = c
 			commonConn.UnitedKey = append(c.PfsKey, nfsKey...) // different unitedKey for each connection
 			nfsAEAD.Seal(clientHello.To(ivAndRelaysLength), nil, binary.BigEndian.AppendUint16(nil, EncryptedTicketLength), nil)
 			nfsAEAD.Seal(clientHello.To(ivAndRelaysLength+EncryptedLengthSize), nil, c.Ticket, nil)
 			c.RWLock.RUnlock()
-			commonConn.PreWrite = clientHello.To(ivAndRelaysLength + EncryptedLengthSize + EncryptedTicketLength)
+			commonConn.PreWrite = bytes.Clone(clientHello.To(ivAndRelaysLength + EncryptedLengthSize + EncryptedTicketLength))
 			commonConn.AEAD = NewAEAD(clientHello.Index(ivAndRelaysLength + EncryptedLengthSize)[:EncryptedTicketLength], commonConn.UnitedKey, commonConn.UseAES)
 			if c.XorMode == XorModeRandom {
 				commonConn.Conn = NewXorConn(conn, NewCTR(commonConn.UnitedKey, iv), nil, len(commonConn.PreWrite), IVLength)
@@ -283,7 +291,7 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 
 	if c.Seconds > 0 && seconds > 0 {
 		c.RWLock.Lock()
-		c.Expire = time.Now().Add(time.Duration(seconds) * time.Second)
+		c.Expire = c.timeFunc().Add(time.Duration(seconds) * time.Second)
 		c.PfsKey = pfsKey
 		c.Ticket = encryptedTicket[:IVLength]
 		c.RWLock.Unlock()

@@ -6,13 +6,14 @@ import (
 	"net"
 
 	N "github.com/sagernet/sing/common/network"
+
 	"lukechampine.com/blake3"
 )
 
 func NewCTR(key, iv []byte) cipher.Stream {
-	k := make([]byte, 32)
-	blake3.DeriveKey(k, Challenge, key) // avoids using key directly
-	block, _ := aes.NewCipher(k)
+	subkey := make([]byte, 32)
+	blake3.DeriveKey(subkey, Challenge, key) // avoids using key directly
+	block, _ := aes.NewCipher(subkey)
 	return cipher.NewCTR(block, iv)
 	// chacha20.NewUnauthenticatedCipher()
 }
