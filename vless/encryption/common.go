@@ -111,7 +111,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 		c.PeerAEAD = NewAEAD(serverRandom, c.UnitedKey, c.UseAES)
-		if xorConn, ok := c.Conn.(*XorConn); ok {
+		if xorConn, isXorConn := c.Conn.(*XorConn); isXorConn {
 			xorConn.PeerCTR = NewCTR(c.UnitedKey, serverRandom)
 		}
 	}
