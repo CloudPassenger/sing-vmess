@@ -27,7 +27,7 @@ type Client struct {
 	encryption *encryption.Client
 }
 
-func NewClient(userId string, flow string, logger logger.Logger, encryptionOptions string) (*Client, error) {
+func NewClient(userId string, flow string, encryptionOptions string, logger logger.Logger) (*Client, error) {
 	user, err := uuid.FromString(userId)
 	if err != nil {
 		user = uuid.NewV5(uuid.Nil, userId)
@@ -38,7 +38,9 @@ func NewClient(userId string, flow string, logger logger.Logger, encryptionOptio
 		return nil, E.New("unsupported flow: " + flow)
 	}
 	var encryptionClient *encryption.Client
-	if encryptionOptions != "" {
+	switch encryptionOptions {
+	case "", "none":
+	default:
 		xorMode, seconds, nfsPKeysBytes, padding, err := encryption.ParseClientEncryption(encryptionOptions)
 		if err != nil {
 			return nil, err
