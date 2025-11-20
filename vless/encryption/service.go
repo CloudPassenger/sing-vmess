@@ -92,7 +92,8 @@ func NewService(ctx context.Context, nfsSKeysBytes [][]byte, xorMode XorMode, se
 		service.Hash32s[i] = blake3.Sum256(service.NfsPKeysBytes[i])
 	}
 	service.RelaysLength -= Hash256Length
-	err := ParsePadding(padding, &service.PaddingLens, &service.PaddingGaps)
+	var err error
+	service.PaddingLens, service.PaddingGaps, err = ParsePadding(padding)
 	if err != nil {
 		return nil, err
 	}

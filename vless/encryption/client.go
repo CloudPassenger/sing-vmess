@@ -92,7 +92,7 @@ func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, sec
 		client.Hash32s[i] = blake3.Sum256(keysByte)
 	}
 	client.RelaysLength -= Hash256Length
-	err = ParsePadding(paddings, &client.PaddingLens, &client.PaddingGaps)
+	client.PaddingLens, client.PaddingGaps, err = ParsePadding(paddings)
 	if err != nil {
 		return nil, err
 	}
