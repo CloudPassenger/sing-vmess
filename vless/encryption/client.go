@@ -59,7 +59,7 @@ type Client struct {
 	Ticket   []byte
 }
 
-func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, seconds uint32, padding string) (client *Client, err error) {
+func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, seconds uint32, paddings []string) (client *Client, err error) {
 	if len(nfsPKeysBytes) == 0 {
 		return nil, E.New("empty nfsPKeysBytes")
 	}
@@ -74,29 +74,32 @@ func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, sec
 	if client.timeFunc == nil {
 		client.timeFunc = time.Now
 	}
-	for j, k := range nfsPKeysBytes {
-		if len(k) == X25519KeySize {
-			if client.NfsPKeys[j], err = ecdh.X25519().NewPublicKey(k); err != nil {
+	for i, keysByte := range nfsPKeysBytes {
+		switch len(keysByte) {
+		case X25519KeySize:
+			if client.NfsPKeys[i], err = ecdh.X25519().NewPublicKey(keysByte); err != nil {
 				return
 			}
 			client.RelaysLength += X25519KeySize + Hash256Length
-		} else {
-			if client.NfsPKeys[j], err = mlkem.NewEncapsulationKey768(k); err != nil {
+		case mlkem.CiphertextSize768:
+			if client.NfsPKeys[i], err = mlkem.NewEncapsulationKey768(keysByte); err != nil {
 				return
 			}
 			client.RelaysLength += mlkem.CiphertextSize768 + Hash256Length
+		default:
+			return nil, E.New("invalid nfsPKeysBytes size of ", i)
 		}
-		client.Hash32s[j] = blake3.Sum256(k)
+		client.Hash32s[i] = blake3.Sum256(keysByte)
 	}
 	client.RelaysLength -= Hash256Length
-	err = ParsePadding(padding, &client.PaddingLens, &client.PaddingGaps)
+	err = ParsePadding(paddings, &client.PaddingLens, &client.PaddingGaps)
 	if err != nil {
 		return nil, err
 	}
 	return client, nil
 }
 
-func ParseClientEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKeysBytes [][]byte, padding string, err error) {
+func ParseEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKeysBytes [][]byte, paddings []string, err error) {
 	parts := strings.Split(raw, ".")
 	if len(parts) != 4 {
 		err = E.New("invalid encryption parts: ", len(parts))
@@ -133,7 +136,6 @@ func ParseClientEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKey
 	}
 
 	keyParts := parts[3:]
-	var paddings []string
 	for _, key := range keyParts {
 		if len(key) < 20 {
 			paddings = append(paddings, key)
@@ -151,7 +153,6 @@ func ParseClientEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKey
 		}
 		nfsPKeysBytes = append(nfsPKeysBytes, decoded)
 	}
-	padding = strings.Join(paddings, ".")
 
 	return
 }
