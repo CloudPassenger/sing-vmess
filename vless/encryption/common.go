@@ -249,12 +249,12 @@ func DecodeHeader(header []byte) (length int, err error) {
 	return
 }
 
-func ParsePadding(padding string, paddingLens, paddingGaps *[][3]int) (err error) {
-	if padding == "" {
+func ParsePadding(padding []string, paddingLens, paddingGaps *[][3]int) (err error) {
+	if len(padding) == 0 {
 		return
 	}
 	maxLen := 0
-	for i, segment := range strings.Split(padding, ".") {
+	for i, segment := range padding {
 		parts := strings.Split(segment, "-")
 		if len(parts) < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 			return E.New("invalid padding length/gap parameter: " + segment)
@@ -292,28 +292,28 @@ func CreatePadding(paddingLens, paddingGaps [][3]int) (length int, lens []int, g
 	}
 	for _, y := range paddingLens {
 		l := 0
-		if y[0] >= randBetween(0, 100) {
-			l = randBetween(y[1], y[2])
+		if y[0] >= int(randBetween(0, 100)) {
+			l = int(randBetween(int64(y[1]), int64(y[2])))
 		}
 		lens = append(lens, l)
 		length += l
 	}
 	for _, y := range paddingGaps {
 		g := 0
-		if y[0] >= randBetween(0, 100) {
-			g = randBetween(y[1], y[2])
+		if y[0] >= int(randBetween(0, 100)) {
+			g = int(randBetween(int64(y[1]), int64(y[2])))
 		}
 		gaps = append(gaps, time.Duration(g)*time.Millisecond)
 	}
 	return
 }
 
-func randBetween(from, to int) int {
+func randBetween(from, to int64) int64 {
 	if from == to {
 		return from
 	}
 	if to < from {
 		from, to = to, from
 	}
-	return from + rand.IntN(to-from)
+	return from + rand.Int64N(to-from)
 }

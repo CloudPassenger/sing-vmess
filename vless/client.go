@@ -42,11 +42,11 @@ func NewClient(ctx context.Context, userId string, flow string, encryptionOption
 	switch encryptionOptions {
 	case "", "none":
 	default:
-		xorMode, seconds, nfsPKeysBytes, padding, err := encryption.ParseClientEncryption(encryptionOptions)
+		xorMode, seconds, nfsPKeysBytes, paddings, err := encryption.ParseEncryption(encryptionOptions)
 		if err != nil {
 			return nil, err
 		}
-		encryptionClient, err = encryption.NewClient(ctx, nfsPKeysBytes, xorMode, seconds, padding)
+		encryptionClient, err = encryption.NewClient(ctx, nfsPKeysBytes, xorMode, seconds, paddings)
 		if err != nil {
 			return nil, err
 		}
