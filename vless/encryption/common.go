@@ -249,7 +249,7 @@ func DecodeHeader(header []byte) (length int, err error) {
 	return
 }
 
-func ParsePadding(padding []string, paddingLens, paddingGaps *[][3]int) (err error) {
+func ParsePadding(padding []string) (paddingLens, paddingGaps [][3]int, err error) {
 	if len(padding) == 0 {
 		return
 	}
@@ -257,7 +257,8 @@ func ParsePadding(padding []string, paddingLens, paddingGaps *[][3]int) (err err
 	for i, segment := range padding {
 		parts := strings.Split(segment, "-")
 		if len(parts) < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-			return E.New("invalid padding length/gap parameter: " + segment)
+			err = E.New("invalid padding length/gap parameter: " + segment)
+			return
 		}
 		parsedValues := [3]int{}
 		if parsedValues[0], err = strconv.Atoi(parts[0]); err != nil {
@@ -270,17 +271,19 @@ func ParsePadding(padding []string, paddingLens, paddingGaps *[][3]int) (err err
 			return
 		}
 		if i == 0 && (parsedValues[0] < 100 || parsedValues[1] < MinPaddingLength || parsedValues[2] < MinPaddingLength) {
-			return E.New("first padding length must not be smaller than 35")
+			err = E.New("first padding length must not be smaller than 35")
+			return
 		}
 		if i%2 == 0 {
-			*paddingLens = append(*paddingLens, parsedValues)
+			paddingLens = append(paddingLens, parsedValues)
 			maxLen += max(parsedValues[1], parsedValues[2])
 		} else {
-			*paddingGaps = append(*paddingGaps, parsedValues)
+			paddingGaps = append(paddingGaps, parsedValues)
 		}
 	}
 	if maxLen > MaxTotalPadding {
-		return E.New("total padding length must not be larger than 65553")
+		err = E.New("total padding length must not be larger than 65553")
+		return
 	}
 	return
 }
