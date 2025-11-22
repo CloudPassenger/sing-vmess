@@ -78,7 +78,7 @@ func NewService(ctx context.Context, nfsSKeysBytes [][]byte, xorMode XorMode, se
 			service.NfsSKeys[i] = key
 			service.NfsPKeysBytes[i] = key.PublicKey().Bytes()
 			service.RelaysLength += X25519KeySize + Hash256Length
-		case mlkem.CiphertextSize768:
+		case mlkem.SeedSize:
 			key, err := mlkem.NewDecapsulationKey768(keyBytes)
 			if err != nil {
 				return nil, E.Cause(err, "initialize mlkem decapsulation key of ", i)
@@ -157,7 +157,7 @@ func ParseDecryption(raw string) (xorMode XorMode, secondsFrom, secondsTo int64,
 		}
 		switch len(decoded) {
 		case X25519KeySize:
-		case mlkem.CiphertextSize768:
+		case mlkem.SeedSize:
 		default:
 			err = E.New("invalid key size ", len(decoded), " of ", i)
 			return
