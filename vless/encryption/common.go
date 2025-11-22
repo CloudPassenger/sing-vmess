@@ -30,9 +30,10 @@ const (
 	MagicHeaderByte2 = 3
 
 	// Protocol field lengths
-	HeaderLength        = 5     // Magic header length
-	IVLength            = 16    // Initialization Vector length
-	NonceLength         = 12    // AEAD nonce length
+	HeaderLength        = 5  // Magic header length
+	IVLength            = 16 // Initialization Vector length
+	NonceLength         = 12 // AEAD nonce length
+	TicketLength        = 16
 	AEADTagLength       = 16    // AEAD authentication tag length
 	Hash256Length       = 32    // BLAKE3 hash length
 	EncryptedLengthSize = 18    // 2-byte length + 16-byte tag
