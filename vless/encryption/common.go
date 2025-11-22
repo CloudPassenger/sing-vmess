@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/sys/cpu"
 	"lukechampine.com/blake3"
 )
 
@@ -41,6 +43,18 @@ const (
 	MaxTotalPadding     = 65553 // Maximum total padding length (18+65535)
 
 	Challenge = "VLESS"
+
+	X25519KeySize = 32
+)
+
+var (
+	// Keep in sync with crypto/internal/fips140/aes/gcm.supportsAESGCM.
+	hasGCMAsmAMD64 = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ && cpu.X86.HasSSE41 && cpu.X86.HasSSSE3
+	hasGCMAsmARM64 = cpu.ARM64.HasAES && cpu.ARM64.HasPMULL
+	hasGCMAsmS390X = cpu.S390X.HasAES && cpu.S390X.HasAESCTR && cpu.S390X.HasGHASH
+	hasGCMAsmPPC64 = runtime.GOARCH == "ppc64" || runtime.GOARCH == "ppc64le"
+
+	hasAESGCMHardwareSupport = hasGCMAsmAMD64 || hasGCMAsmARM64 || hasGCMAsmS390X || hasGCMAsmPPC64
 )
 
 var (
