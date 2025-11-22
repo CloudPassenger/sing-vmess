@@ -46,9 +46,9 @@ type Service struct {
 
 	sessionAccess sync.RWMutex
 	timeFunc      func() time.Time
-	Lasts         map[int64][16]byte
-	Tickets       [][16]byte
-	Sessions      map[[16]byte]*ServiceSession
+	Lasts         map[int64][TicketLength]byte
+	Tickets       [][TicketLength]byte
+	Sessions      map[[TicketLength]byte]*ServiceSession
 }
 
 func NewService(ctx context.Context, nfsSKeysBytes [][]byte, xorMode XorMode, secondsFrom, secondsTo int64, padding []string) (*Service, error) {
@@ -177,9 +177,9 @@ func (s *Service) Start() error {
 
 func (s *Service) loopCleanLegacySessions() {
 	s.closed = make(chan struct{})
-	s.Lasts = make(map[int64][16]byte)
-	s.Tickets = make([][16]byte, 0, 1024)
-	s.Sessions = make(map[[16]byte]*ServiceSession)
+	s.Lasts = make(map[int64][TicketLength]byte)
+	s.Tickets = make([][TicketLength]byte, 0, 1024)
+	s.Sessions = make(map[[TicketLength]byte]*ServiceSession)
 
 	const CLeanDuration = 1 * time.Minute
 	timer := time.NewTimer(CLeanDuration)
@@ -224,7 +224,7 @@ func (s *Service) Close() error {
 func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error) {
 	commonConn := NewCommonConn(conn, true)
 
-	ivAndRelays := buf.NewSize(16 + s.RelaysLength)
+	ivAndRelays := buf.NewSize(IVLength + s.RelaysLength)
 	defer ivAndRelays.Release()
 	_, err := ivAndRelays.ReadFullFrom(conn, ivAndRelays.Cap())
 	if err != nil {
@@ -233,15 +233,15 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	if fallback != nil {
 		*fallback = append(*fallback, ivAndRelays.Bytes()...)
 	}
-	iv := ivAndRelays.To(16)
-	relays := ivAndRelays.From(16)
+	iv := ivAndRelays.To(IVLength)
+	relays := ivAndRelays.From(IVLength)
 	var (
 		nfsKey  []byte
 		lastCTR cipher.Stream
 	)
 	for i, key := range s.NfsSKeys {
 		if lastCTR != nil {
-			lastCTR.XORKeyStream(relays, relays[:32]) // recover this relay
+			lastCTR.XORKeyStream(relays, relays[:EncryptedTicketLength]) // recover this relay
 		}
 		var index int
 		switch key.(type) {
@@ -283,8 +283,8 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 		}
 		relays = relays[index:]
 		lastCTR = NewCTR(nfsKey, iv)
-		lastCTR.XORKeyStream(relays, relays[:32])
-		if !bytes.Equal(relays[:32], s.Hash32s[i+1][:]) {
+		lastCTR.XORKeyStream(relays, relays[:Hash256Length])
+		if !bytes.Equal(relays[:Hash256Length], s.Hash32s[i+1][:]) {
 			return nil, E.New("unexpected hash 32: ", fmt.Sprint(relays[:32]))
 		}
 		relays = relays[32:]
@@ -312,11 +312,11 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	}
 	length := binary.BigEndian.Uint16(decryptedLength[:2])
 
-	if length == 32 {
+	if length == EncryptedTicketLength {
 		if !s.allow0Rtt() {
 			return nil, E.New("0-rtt is forbidden")
 		}
-		encryptedTicket := make([]byte, 32)
+		encryptedTicket := make([]byte, EncryptedTicketLength)
 		_, err = io.ReadFull(conn, encryptedTicket)
 		if err != nil {
 			return nil, err
@@ -326,7 +326,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 			return nil, E.Cause(err, "open encrypted ticket")
 		}
 		s.sessionAccess.Lock()
-		session := s.Sessions[[16]byte(ticket)]
+		session := s.Sessions[[TicketLength]byte(ticket)]
 		s.sessionAccess.Unlock()
 		if session == nil {
 			noises := buf.NewSize(int(randBetween(1279, 2279))) // matches 1-RTT's server hello length for "random", though it is not important, just for example
@@ -343,11 +343,11 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 			_, _ = conn.Write(noises.Bytes()) // make client do new handshake
 			return nil, E.New("expired ticket")
 		}
-		if _, loaded := session.NfsKeys.Load([32]byte(nfsKey)); loaded { // prevents bad client also
+		if _, loaded := session.NfsKeys.Load([EncryptedTicketLength]byte(nfsKey)); loaded { // prevents bad client also
 			return nil, E.New("replay detected!")
 		}
 		commonConn.UnitedKey = append(session.PfsKey, nfsKey...) // the same nfsKey links the upload & download (prevents server -> client's another request)
-		commonConn.PreWrite = make([]byte, 16)
+		commonConn.PreWrite = make([]byte, TicketLength)
 		rand.Read(commonConn.PreWrite) // always trust yourself, not the client (also prevents being parsed as TLS thus causing false interruption for "native" and "xorpub")
 		commonConn.AEAD = NewAEAD(commonConn.PreWrite, commonConn.UnitedKey, commonConn.UseAES)
 		commonConn.PeerAEAD = NewAEAD(encryptedTicket, commonConn.UnitedKey, commonConn.UseAES) // unchangeable ctx (prevents server -> server), and different ctx length for upload / download (prevents client -> client)
@@ -357,7 +357,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 		return commonConn, nil
 	}
 
-	if length < mlkem.EncapsulationKeySize768+32+16 { // client may send more public keys in the future's version
+	if length < EncryptedPfsPublicKeyLength { // client may send more public keys in the future's version
 		return nil, io.ErrShortWrite
 	}
 	encryptedPfsPublicKey := buf.NewSize(int(length))
@@ -388,9 +388,9 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	pfsPublicKey := append(encapsulatedPfsKey, x25519SKey.PublicKey().Bytes()...)
 	commonConn.UnitedKey = append(pfsKey, nfsKey...)
 	commonConn.AEAD = NewAEAD(pfsPublicKey, commonConn.UnitedKey, commonConn.UseAES)
-	commonConn.PeerAEAD = NewAEAD(encryptedPfsPublicKey.To(mlkem.EncapsulationKeySize768+32), commonConn.UnitedKey, commonConn.UseAES)
+	commonConn.PeerAEAD = NewAEAD(encryptedPfsPublicKey.To(mlkem.EncapsulationKeySize768+EncryptedTicketLength), commonConn.UnitedKey, commonConn.UseAES)
 
-	ticket := [16]byte{}
+	ticket := [TicketLength]byte{}
 	rand.Read(ticket[:])
 	var seconds int64
 	if s.SecondsTo == 0 {
@@ -407,21 +407,17 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 		s.sessionAccess.Unlock()
 	}
 
-	const (
-		pfsKeyExchangeLength  = mlkem.CiphertextSize768 + 32 + 16
-		encryptedTicketLength = 32
-	)
 	paddingLength, paddingLens, paddingGaps := CreatePadding(s.PaddingLens, s.PaddingGaps)
-	serverHello := buf.NewSize(pfsKeyExchangeLength + encryptedTicketLength + paddingLength)
+	serverHello := buf.NewSize(EncryptedPfsPublicKeyLength + EncryptedTicketLength + paddingLength)
 	defer serverHello.Release()
 	nfsAead.Seal(serverHello.Index(0), MaxNonce, pfsPublicKey, nil)
-	commonConn.AEAD.Seal(serverHello.Index(pfsKeyExchangeLength), nil, ticket[:], nil)
-	const paddingIndex = pfsKeyExchangeLength + encryptedTicketLength
+	commonConn.AEAD.Seal(serverHello.Index(EncryptedPfsPublicKeyLength), nil, ticket[:], nil)
+	const paddingIndex = EncryptedPfsPublicKeyLength + EncryptedTicketLength
 	commonConn.AEAD.Seal(serverHello.Index(paddingIndex), nil, binary.BigEndian.AppendUint16(nil, uint16(paddingLength-18)), nil)
 	commonConn.AEAD.Seal(serverHello.Index(paddingIndex+18), nil, serverHello.Range(paddingIndex+18, paddingIndex+paddingLength-16), nil)
 	serverHello.Truncate(serverHello.Cap())
 
-	paddingLens[0] += pfsKeyExchangeLength + encryptedTicketLength
+	paddingLens[0] += paddingIndex
 	for i, paddingLen := range paddingLens { // sends padding in a fragmented way, to create variable traffic pattern, before inner VLESS flow takes control
 		if paddingLen > 0 {
 			_, err = conn.Write(serverHello.To(paddingLen))

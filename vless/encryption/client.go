@@ -28,7 +28,6 @@ const (
 	PfsKeySize           = Hash256Length + Hash256Length                                                       // ML-KEM-768 shared key + X25519 shared key
 	PfsPublicKeyLength   = mlkem.EncapsulationKeySize768 + X25519KeySize                                       // 1184 + 32
 
-	// Server response lengths
 	EncryptedPfsPublicKeyLength = mlkem.CiphertextSize768 + X25519KeySize + AEADTagLength // 1088 + 32 + 16
 	EncryptedTicketLength       = Hash256Length                                           // 32
 )
