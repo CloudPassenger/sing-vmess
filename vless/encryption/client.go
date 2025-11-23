@@ -80,13 +80,13 @@ func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, sec
 				return
 			}
 			client.RelaysLength += X25519KeySize + Hash256Length
-		case mlkem.CiphertextSize768:
+		case mlkem.EncapsulationKeySize768:
 			if client.NfsPKeys[i], err = mlkem.NewEncapsulationKey768(keysByte); err != nil {
 				return
 			}
 			client.RelaysLength += mlkem.CiphertextSize768 + Hash256Length
 		default:
-			return nil, E.New("invalid nfsPKeysBytes size of ", i)
+			return nil, E.New("invalid nfsPKeysBytes size ", len(keysByte), " of ", i)
 		}
 		client.Hash32s[i] = blake3.Sum256(keysByte)
 	}
@@ -135,7 +135,7 @@ func ParseEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKeysBytes
 	}
 
 	keyParts := parts[3:]
-	for _, key := range keyParts {
+	for i, key := range keyParts {
 		if len(key) < 20 {
 			paddings = append(paddings, key)
 			continue
@@ -146,8 +146,11 @@ func ParseEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKeysBytes
 			err = E.New("decode base64 of key: ", key)
 			return
 		}
-		if len(decoded) != X25519KeySize && len(decoded) != mlkem.EncapsulationKeySize768 {
-			err = E.New("invalid key length: ", key)
+		switch len(decoded) {
+		case X25519KeySize:
+		case mlkem.EncapsulationKeySize768:
+		default:
+			err = E.New("invalid key length ", len(decoded), " of ", i)
 			return
 		}
 		nfsPKeysBytes = append(nfsPKeysBytes, decoded)
@@ -157,21 +160,21 @@ func ParseEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKeysBytes
 }
 
 func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
-	commonConn = NewCommonConn(conn, hasAESGCMHardwareSupport)
+	commonConn = NewCommonConn(conn, HasAESGCMHardwareSupport)
 
 	ivAndRelaysLength := IVLength + c.RelaysLength
-	pfsKeyExchangeLength := PfsKeyExchangeLength
 	paddingLength, paddingLens, paddingGaps := CreatePadding(c.PaddingLens, c.PaddingGaps)
-	clientHello := buf.NewSize(ivAndRelaysLength + pfsKeyExchangeLength + paddingLength)
+	clientHello := buf.NewSize(ivAndRelaysLength + PfsKeyExchangeLength + paddingLength)
 	defer clientHello.Release()
 
-	iv := clientHello.To(IVLength)
-	rand.Read(iv)
-	relays := clientHello.Index(IVLength)[:ivAndRelaysLength-IVLength]
+	iv := clientHello.WriteRandom(IVLength)
+	relays := clientHello.Extend(c.RelaysLength)
+	pfsKeyExchange := clientHello.Extend(PfsKeyExchangeLength)
+	padding := clientHello.Extend(paddingLength)
 	var nfsKey []byte
 	var lastCTR cipher.Stream
 	for i, key := range c.NfsPKeys {
-		var index = X25519KeySize
+		var index int
 		switch key.(type) {
 		case *ecdh.PublicKey:
 			x25519Key := key.(*ecdh.PublicKey)
@@ -181,6 +184,7 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 			if err != nil {
 				return nil, err
 			}
+			index = X25519KeySize
 		case *mlkem.EncapsulationKey768:
 			mlkemKey := key.(*mlkem.EncapsulationKey768)
 			var ciphertext []byte
@@ -214,7 +218,7 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 			nfsAEAD.Seal(clientHello.To(ivAndRelaysLength+EncryptedLengthSize), nil, c.Ticket, nil)
 			c.RWLock.RUnlock()
 			commonConn.PreWrite = bytes.Clone(clientHello.To(ivAndRelaysLength + EncryptedLengthSize + EncryptedTicketLength))
-			commonConn.AEAD = NewAEAD(clientHello.Index(ivAndRelaysLength + EncryptedLengthSize)[:EncryptedTicketLength], commonConn.UnitedKey, commonConn.UseAES)
+			commonConn.AEAD = NewAEAD(clientHello.Range(ivAndRelaysLength+EncryptedLengthSize, ivAndRelaysLength+EncryptedLengthSize+EncryptedTicketLength), commonConn.UnitedKey, commonConn.UseAES)
 			if c.XorMode == XorModeRandom {
 				commonConn.Conn = NewXorConn(conn, NewCTR(commonConn.UnitedKey, iv), nil, len(commonConn.PreWrite), IVLength)
 			}
@@ -223,49 +227,42 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 		c.RWLock.RUnlock()
 	}
 
-	pfsKeyExchange := clientHello.Index(ivAndRelaysLength)[:pfsKeyExchangeLength]
-	nfsAEAD.Seal(pfsKeyExchange[:0], nil, binary.BigEndian.AppendUint16(nil, uint16(pfsKeyExchangeLength-EncryptedLengthSize)), nil)
+	nfsAEAD.Seal(pfsKeyExchange[:0], nil, binary.BigEndian.AppendUint16(nil, uint16(PfsKeyExchangeLength-EncryptedLengthSize)), nil)
 	mlkem768DKey, _ := mlkem.GenerateKey768()
 	x25519SKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	pfsPublicKey := append(mlkem768DKey.EncapsulationKey().Bytes(), x25519SKey.PublicKey().Bytes()...)
 	nfsAEAD.Seal(pfsKeyExchange[:EncryptedLengthSize], nil, pfsPublicKey, nil)
 
-	padding := clientHello.Index(ivAndRelaysLength + pfsKeyExchangeLength)
 	nfsAEAD.Seal(padding[:0], nil, binary.BigEndian.AppendUint16(nil, uint16(paddingLength-EncryptedLengthSize)), nil)
 	nfsAEAD.Seal(padding[:EncryptedLengthSize], nil, padding[EncryptedLengthSize:paddingLength-AEADTagLength], nil)
 
-	offset := ivAndRelaysLength + pfsKeyExchangeLength
+	clientHelloBytes := clientHello.Bytes()
+	paddingLens[0] += ivAndRelaysLength + PfsKeyExchangeLength
 	for i, l := range paddingLens { // sends padding in a fragmented way, to create variable traffic pattern, before inner VLESS flow takes control
-		writeLen := l
-		if i == 0 {
-			writeLen = offset + l
-		}
-		if writeLen > 0 {
-			if i == 0 {
-				clientHello.Resize(0, writeLen)
-			} else {
-				clientHello.Truncate(writeLen)
-			}
-			if _, err := conn.Write(clientHello.Bytes()[:writeLen]); err != nil {
+		if l > 0 {
+			_, err = conn.Write(clientHelloBytes[:l])
+			if err != nil {
 				return nil, err
 			}
-			clientHello.Advance(writeLen)
+			clientHelloBytes = clientHelloBytes[l:]
 		}
 		if len(paddingGaps) > i {
 			time.Sleep(paddingGaps[i])
 		}
 	}
 
-	encryptedPfsPublicKey := make([]byte, EncryptedPfsPublicKeyLength)
-	if _, err := io.ReadFull(conn, encryptedPfsPublicKey); err != nil {
-		return nil, err
-	}
-	nfsAEAD.Open(encryptedPfsPublicKey[:0], MaxNonce, encryptedPfsPublicKey, nil)
-	mlkem768Key, err := mlkem768DKey.Decapsulate(encryptedPfsPublicKey[:mlkem.CiphertextSize768])
+	encryptedPfsPublicKey := buf.NewSize(EncryptedPfsPublicKeyLength)
+	defer encryptedPfsPublicKey.Release()
+	_, err = encryptedPfsPublicKey.ReadFullFrom(conn, encryptedPfsPublicKey.Cap())
 	if err != nil {
 		return nil, err
 	}
-	peerX25519PKey, err := ecdh.X25519().NewPublicKey(encryptedPfsPublicKey[mlkem.CiphertextSize768 : mlkem.CiphertextSize768+X25519KeySize])
+	nfsAEAD.Open(encryptedPfsPublicKey.Index(0), MaxNonce, encryptedPfsPublicKey.Bytes(), nil)
+	mlkem768Key, err := mlkem768DKey.Decapsulate(encryptedPfsPublicKey.To(mlkem.CiphertextSize768))
+	if err != nil {
+		return nil, err
+	}
+	peerX25519PKey, err := ecdh.X25519().NewPublicKey(encryptedPfsPublicKey.Range(mlkem.CiphertextSize768, mlkem.CiphertextSize768+X25519KeySize))
 	if err != nil {
 		return nil, err
 	}
@@ -273,12 +270,10 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 	if err != nil {
 		return nil, err
 	}
-	pfsKey := make([]byte, PfsKeySize) // no more capacity
-	copy(pfsKey, mlkem768Key)
-	copy(pfsKey[Hash256Length:], x25519Key)
+	pfsKey := append(mlkem768Key, x25519Key...)
 	commonConn.UnitedKey = append(pfsKey, nfsKey...)
 	commonConn.AEAD = NewAEAD(pfsPublicKey, commonConn.UnitedKey, commonConn.UseAES)
-	commonConn.PeerAEAD = NewAEAD(encryptedPfsPublicKey[:mlkem.CiphertextSize768+X25519KeySize], commonConn.UnitedKey, commonConn.UseAES)
+	commonConn.PeerAEAD = NewAEAD(encryptedPfsPublicKey.To(mlkem.CiphertextSize768+X25519KeySize), commonConn.UnitedKey, commonConn.UseAES)
 
 	encryptedTicket := make([]byte, EncryptedTicketLength)
 	if _, err := io.ReadFull(conn, encryptedTicket); err != nil {

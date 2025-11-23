@@ -50,6 +50,13 @@ func NewClient(ctx context.Context, userId string, flow string, encryptionOption
 		if err != nil {
 			return nil, err
 		}
+		var aeadType string
+		if encryption.HasAESGCMHardwareSupport {
+			aeadType = "aes"
+		} else {
+			aeadType = "chacha20"
+		}
+		logger.Info("Using encryption client with AEAD: ", aeadType)
 	}
 	return &Client{user, flow, logger, encryptionClient}, nil
 }

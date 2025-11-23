@@ -59,6 +59,13 @@ func NewService[T comparable](ctx context.Context, decryptionOptions string, log
 func (s *Service[T]) Start() error {
 	if s.decryption != nil {
 		_ = s.decryption.Start()
+		var aeadType string
+		if encryption.HasAESGCMHardwareSupport {
+			aeadType = "aes"
+		} else {
+			aeadType = "chacha20"
+		}
+		s.logger.Info("decryption server started with default AEAD: ", aeadType)
 	}
 	return nil
 }

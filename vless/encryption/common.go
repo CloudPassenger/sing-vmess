@@ -55,7 +55,7 @@ var (
 	hasGCMAsmS390X = cpu.S390X.HasAES && cpu.S390X.HasAESCTR && cpu.S390X.HasGHASH
 	hasGCMAsmPPC64 = runtime.GOARCH == "ppc64" || runtime.GOARCH == "ppc64le"
 
-	hasAESGCMHardwareSupport = hasGCMAsmAMD64 || hasGCMAsmARM64 || hasGCMAsmS390X || hasGCMAsmPPC64
+	HasAESGCMHardwareSupport = hasGCMAsmAMD64 || hasGCMAsmARM64 || hasGCMAsmS390X || hasGCMAsmPPC64
 )
 
 var (
@@ -151,7 +151,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		if c.Client != nil && E.IsMulti(err, ErrInvalidHeader) { // client's 0-RTT
 			c.Client.RWLock.Lock()
 			if bytes.HasPrefix(c.UnitedKey, c.Client.PfsKey) {
-				c.Client.Expire = time.Now() // expired
+				c.Client.Expire = c.Client.timeFunc() // expired
 			}
 			c.Client.RWLock.Unlock()
 			return 0, E.New("new handshake needed")
@@ -179,7 +179,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		c.PeerAEAD = newAEAD
 	}
 	if err != nil {
-		return 0, err
+		return 0, E.Cause(err, "CommonConn: open dst")
 	}
 	if len(dst) > len(b) {
 		c.input.Reset(dst[copy(b, dst):])
