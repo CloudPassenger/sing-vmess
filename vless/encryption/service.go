@@ -285,9 +285,9 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 		lastCTR = NewCTR(nfsKey, iv)
 		lastCTR.XORKeyStream(relays, relays[:Hash256Length])
 		if !bytes.Equal(relays[:Hash256Length], s.Hash32s[i+1][:]) {
-			return nil, E.New("unexpected hash 32: ", fmt.Sprint(relays[:32]))
+			return nil, E.New("unexpected hash 32: ", fmt.Sprint(relays[:Hash256Length]))
 		}
-		relays = relays[32:]
+		relays = relays[Hash256Length:]
 	}
 	nfsAead := NewAEAD(iv, nfsKey, commonConn.UseAES)
 
@@ -303,14 +303,14 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	if _, err0 := nfsAead.Open(decryptedLength[:0], nil, encryptedLength, nil); err0 != nil {
 		commonConn.UseAES = !commonConn.UseAES
 		nfsAead = NewAEAD(iv, nfsKey, commonConn.UseAES)
-		if _, err1 := nfsAead.Open(decryptedLength[:0], nil, decryptedLength, nil); err1 != nil {
+		if _, err1 := nfsAead.Open(decryptedLength[:0], nil, encryptedLength, nil); err1 != nil {
 			return nil, E.Cause(E.Errors(err0, err1), "try decrypt length with aes and chacha20")
 		}
 	}
 	if fallback != nil {
 		*fallback = nil
 	}
-	length := binary.BigEndian.Uint16(decryptedLength[:2])
+	length := binary.BigEndian.Uint16(decryptedLength)
 
 	if length == EncryptedTicketLength {
 		if !s.allow0Rtt() {
@@ -358,7 +358,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	}
 
 	if length < EncryptedPfsPublicKeyLength { // client may send more public keys in the future's version
-		return nil, io.ErrShortWrite
+		return nil, io.ErrUnexpectedEOF
 	}
 	encryptedPfsPublicKey := buf.NewSize(int(length))
 	defer encryptedPfsPublicKey.Release()
@@ -368,7 +368,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	}
 	_, err = nfsAead.Open(encryptedPfsPublicKey.Index(0), nil, encryptedPfsPublicKey.Bytes(), nil)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "open encrypted public key")
 	}
 	mlkem768EKey, err := mlkem.NewEncapsulationKey768(encryptedPfsPublicKey.To(mlkem.EncapsulationKeySize768))
 	if err != nil {
@@ -414,7 +414,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	commonConn.AEAD.Seal(serverHello.Index(EncryptedPfsPublicKeyLength), nil, ticket[:], nil)
 	const paddingIndex = EncryptedPfsPublicKeyLength + EncryptedTicketLength
 	commonConn.AEAD.Seal(serverHello.Index(paddingIndex), nil, binary.BigEndian.AppendUint16(nil, uint16(paddingLength-18)), nil)
-	commonConn.AEAD.Seal(serverHello.Index(paddingIndex+18), nil, serverHello.Range(paddingIndex+18, paddingIndex+paddingLength-16), nil)
+	commonConn.AEAD.Seal(serverHello.Index(paddingIndex+EncryptedLengthSize), nil, serverHello.Range(paddingIndex+18, paddingIndex+paddingLength-16), nil)
 	serverHello.Truncate(serverHello.Cap())
 
 	paddingLens[0] += paddingIndex
@@ -438,7 +438,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	}
 	_, err = nfsAead.Open(encryptedLength[:0], nil, encryptedLength, nil)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "open encrypted length")
 	}
 	encryptedPadding := buf.NewSize(int(binary.BigEndian.Uint16(encryptedLength)))
 	defer encryptedPadding.Release()
@@ -448,7 +448,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 	}
 	_, err = nfsAead.Open(encryptedPadding.Index(0), nil, encryptedPadding.Bytes(), nil)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "open encrypted padding")
 	}
 
 	if s.XorMode == XorModeRandom {
