@@ -217,7 +217,9 @@ func (s *Service) allow0Rtt() bool {
 func (s *Service) Close() error {
 	s.sessionAccess.Lock()
 	defer s.sessionAccess.Unlock()
-	close(s.closed)
+	if s.closed != nil {
+		close(s.closed)
+	}
 	return nil
 }
 
