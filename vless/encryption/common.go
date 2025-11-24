@@ -89,8 +89,7 @@ type CommonConn struct {
 	aead        *AEAD
 	peerAEAD    *AEAD
 	peerPadding []byte
-	rawInput    bytes.Buffer // PeerInBytes
-	input       bytes.Reader // PeerCache
+	lastRead    *buf.Buffer
 }
 
 func NewCommonConn(conn net.Conn, useAES bool) *CommonConn {
@@ -113,7 +112,7 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 		headerAndData := buf.NewSize(len(c.preWrite) + HeaderLength + len(b) + c.aead.Overhead())
 		preWrite := c.preWrite
 		if preWrite != nil {
-			headerAndData.Write(preWrite)
+			common.Must1(headerAndData.Write(preWrite))
 			c.preWrite = nil
 		}
 		encodeHeader(headerAndData.Extend(HeaderLength), len(b)+c.aead.Overhead())
@@ -135,14 +134,23 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *CommonConn) Read(b []byte) (int, error) {
+func (c *CommonConn) Read(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	if c.lastRead != nil {
+		n, err = c.lastRead.Read(b)
+		if c.lastRead.IsEmpty() {
+			c.lastRead.Release()
+			c.lastRead = nil
+		}
+		return
+	}
 	if c.peerAEAD == nil { // client's 0-RTT
 		serverRandom := make([]byte, IVLength)
-		if _, err := io.ReadFull(c.conn, serverRandom); err != nil {
-			return 0, err
+		_, err = io.ReadFull(c.conn, serverRandom)
+		if err != nil {
+			return
 		}
 		c.peerAEAD = NewAEAD(serverRandom, c.unitedKey, c.useAES)
 		if xorConn, isXorConn := c.conn.(*XorConn); isXorConn {
@@ -150,22 +158,22 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		}
 	}
 	if c.peerPadding != nil { // client's 1-RTT
-		if _, err := io.ReadFull(c.conn, c.peerPadding); err != nil {
-			return 0, err
+		_, err = io.ReadFull(c.conn, c.peerPadding)
+		if err != nil {
+			return
 		}
-		if _, err := c.peerAEAD.Open(c.peerPadding[:0], nil, c.peerPadding, nil); err != nil {
-			return 0, err
+		_, err = c.peerAEAD.Open(c.peerPadding[:0], nil, c.peerPadding, nil)
+		if err != nil {
+			return
 		}
 		c.peerPadding = nil
 	}
-	if c.input.Len() > 0 {
-		return c.input.Read(b)
+	peerHeader := make([]byte, HeaderLength)
+	_, err = io.ReadFull(c.conn, peerHeader)
+	if err != nil {
+		return
 	}
-	peerHeader := [HeaderLength]byte{}
-	if _, err := io.ReadFull(c.conn, peerHeader[:]); err != nil {
-		return 0, err
-	}
-	l, err := decodeHeader(peerHeader[:]) // l: 17~17000
+	l, err := decodeHeader(peerHeader) // l: 17~17000
 	if err != nil {
 		if c.client != nil && E.IsMulti(err, ErrInvalidHeader) { // client's 0-RTT
 			c.client.ticketAccess.Lock()
@@ -175,39 +183,66 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 			c.client.ticketAccess.Unlock()
 			return 0, E.Extend(err, "new handshake needed")
 		}
-		return 0, err
+		return
 	}
 	c.client = nil
-	if c.rawInput.Cap() < l {
-		c.rawInput.Grow(l) // no need to use sync.Pool, because we are always reading
+	// Fast path: Use b as a buffer to decrypt so that we can avoid allocation and coping.
+	if l <= len(b) {
+		_, err = io.ReadFull(c.conn, b[:l])
+		if err != nil {
+			return 0, err
+		}
+		var newAEAD *AEAD
+		if bytes.Equal(c.peerAEAD.Nonce[:], maxNonce) {
+			// Prevent nonce overflow panic
+			newAEAD = NewAEAD(append(peerHeader, b[:l]...), c.unitedKey, c.useAES)
+		}
+		_, err = c.peerAEAD.Open(b[:0], nil, b[:l], peerHeader)
+		if newAEAD != nil {
+			c.peerAEAD = newAEAD
+		}
+		if err != nil {
+			return 0, E.Cause(err, "CommonConn: open peer data")
+		}
+		return l - c.peerAEAD.Overhead(), nil
 	}
-	peerData := c.rawInput.Bytes()[:l]
-	if _, err := io.ReadFull(c.conn, peerData); err != nil {
-		return 0, err
-	}
-	dst := peerData[:l-AEADTagLength]
-	if len(dst) <= len(b) {
-		dst = b[:len(dst)] // avoids another copy()
+	peerData := buf.NewSize(l)
+	shouldRelease := true
+	defer func() {
+		if shouldRelease {
+			peerData.Release()
+		}
+	}()
+	_, err = peerData.ReadFullFrom(c.conn, peerData.Cap())
+	if err != nil {
+		return
 	}
 	var newAEAD *AEAD
 	if bytes.Equal(c.peerAEAD.Nonce[:], maxNonce) {
-		newAEAD = NewAEAD(append(peerHeader[:], peerData...), c.unitedKey, c.useAES)
+		// Prevent nonce overflow panic
+		newAEAD = NewAEAD(append(peerHeader, peerData.Bytes()...), c.unitedKey, c.useAES)
 	}
-	_, err = c.peerAEAD.Open(dst[:0], nil, peerData, peerHeader[:])
+	_, err = c.peerAEAD.Open(peerData.Index(0), nil, peerData.Bytes(), peerHeader)
 	if newAEAD != nil {
 		c.peerAEAD = newAEAD
 	}
 	if err != nil {
 		return 0, E.Cause(err, "CommonConn: open dst")
 	}
-	if len(dst) > len(b) {
-		c.input.Reset(dst[copy(b, dst):])
-		dst = b // for len(dst)
+	peerData.Truncate(peerData.Cap() - c.peerAEAD.Overhead())
+	n, err = peerData.Read(b)
+	if !peerData.IsEmpty() {
+		shouldRelease = false
+		c.lastRead = peerData
 	}
-	return len(dst), nil
+	return
 }
 
 func (c *CommonConn) Close() error {
+	if c.lastRead != nil {
+		c.lastRead.Release()
+		c.lastRead = nil
+	}
 	return common.Close(c.conn)
 }
 
