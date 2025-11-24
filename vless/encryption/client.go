@@ -32,30 +32,21 @@ const (
 	EncryptedTicketLength       = Hash256Length                                           // 32
 )
 
-// XorMode represents the XOR encryption mode for obfuscation
-type XorMode byte
-
-const (
-	XorModeNative XorMode = 0 // No XOR obfuscation
-	XorModeXorPub XorMode = 1 // XOR obfuscation for public key/ciphertext only
-	XorModeRandom XorMode = 2 // Full XOR obfuscation for all traffic
-)
-
 type Client struct {
-	NfsPKeys      []any
-	NfsPKeysBytes [][]byte
-	Hash32s       [][Hash256Length]byte
-	RelaysLength  int
-	XorMode       XorMode
-	Seconds       uint32
-	PaddingLens   [][3]int
-	PaddingGaps   [][3]int
+	nfsPKeys      []any
+	nfsPKeysBytes [][]byte
+	hash32s       [][Hash256Length]byte
+	relaysLength  int
+	xorMode       XorMode
+	seconds       uint32
+	paddingLens   [][3]int
+	paddingGaps   [][3]int
 
-	RWLock   sync.RWMutex
-	timeFunc func() time.Time
-	Expire   time.Time
-	PfsKey   []byte
-	Ticket   []byte
+	ticketAccess sync.RWMutex
+	timeFunc     func() time.Time
+	expireAt     time.Time
+	pfsKey       []byte
+	ticket       []byte
 }
 
 func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, seconds uint32, paddings []string) (client *Client, err error) {
@@ -63,11 +54,11 @@ func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, sec
 		return nil, E.New("empty nfsPKeysBytes")
 	}
 	client = &Client{
-		NfsPKeys:      make([]any, len(nfsPKeysBytes)),
-		NfsPKeysBytes: nfsPKeysBytes,
-		Hash32s:       make([][Hash256Length]byte, len(nfsPKeysBytes)),
-		XorMode:       xorMode,
-		Seconds:       seconds,
+		nfsPKeys:      make([]any, len(nfsPKeysBytes)),
+		nfsPKeysBytes: nfsPKeysBytes,
+		hash32s:       make([][Hash256Length]byte, len(nfsPKeysBytes)),
+		xorMode:       xorMode,
+		seconds:       seconds,
 		timeFunc:      ntp.TimeFuncFromContext(ctx),
 	}
 	if client.timeFunc == nil {
@@ -76,22 +67,22 @@ func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, sec
 	for i, keysByte := range nfsPKeysBytes {
 		switch len(keysByte) {
 		case X25519KeySize:
-			if client.NfsPKeys[i], err = ecdh.X25519().NewPublicKey(keysByte); err != nil {
+			if client.nfsPKeys[i], err = ecdh.X25519().NewPublicKey(keysByte); err != nil {
 				return
 			}
-			client.RelaysLength += X25519KeySize + Hash256Length
+			client.relaysLength += X25519KeySize + Hash256Length
 		case mlkem.EncapsulationKeySize768:
-			if client.NfsPKeys[i], err = mlkem.NewEncapsulationKey768(keysByte); err != nil {
+			if client.nfsPKeys[i], err = mlkem.NewEncapsulationKey768(keysByte); err != nil {
 				return
 			}
-			client.RelaysLength += mlkem.CiphertextSize768 + Hash256Length
+			client.relaysLength += mlkem.CiphertextSize768 + Hash256Length
 		default:
 			return nil, E.New("invalid nfsPKeysBytes size ", len(keysByte), " of ", i)
 		}
-		client.Hash32s[i] = blake3.Sum256(keysByte)
+		client.hash32s[i] = blake3.Sum256(keysByte)
 	}
-	client.RelaysLength -= Hash256Length
-	client.PaddingLens, client.PaddingGaps, err = ParsePadding(paddings)
+	client.relaysLength -= Hash256Length
+	client.paddingLens, client.paddingGaps, err = ParsePadding(paddings)
 	if err != nil {
 		return nil, err
 	}
@@ -162,18 +153,18 @@ func ParseEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKeysBytes
 func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 	commonConn = NewCommonConn(conn, HasAESGCMHardwareSupport)
 
-	ivAndRelaysLength := IVLength + c.RelaysLength
-	paddingLength, paddingLens, paddingGaps := CreatePadding(c.PaddingLens, c.PaddingGaps)
+	ivAndRelaysLength := IVLength + c.relaysLength
+	paddingLength, paddingLens, paddingGaps := CreatePadding(c.paddingLens, c.paddingGaps)
 	clientHello := buf.NewSize(ivAndRelaysLength + PfsKeyExchangeLength + paddingLength)
 	defer clientHello.Release()
 
 	iv := clientHello.WriteRandom(IVLength)
-	relays := clientHello.Extend(c.RelaysLength)
+	relays := clientHello.Extend(c.relaysLength)
 	pfsKeyExchange := clientHello.Extend(PfsKeyExchangeLength)
 	padding := clientHello.Extend(paddingLength)
 	var nfsKey []byte
 	var lastCTR cipher.Stream
-	for i, key := range c.NfsPKeys {
+	for i, key := range c.nfsPKeys {
 		var index int
 		switch key.(type) {
 		case *ecdh.PublicKey:
@@ -194,37 +185,37 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 		default:
 			panic("invalid key type")
 		}
-		if c.XorMode != XorModeNative { // this xor can (others can't) be recovered by client's config, revealing an X25519 public key / ML-KEM-768 ciphertext, that's why "native" values
-			NewCTR(c.NfsPKeysBytes[i], iv).XORKeyStream(relays, relays[:index]) // make X25519 public key / ML-KEM-768 ciphertext distinguishable from random bytes
+		if c.xorMode != XorModeNative { // this xor can (others can't) be recovered by client's config, revealing an X25519 public key / ML-KEM-768 ciphertext, that's why "native" values
+			NewCTR(c.nfsPKeysBytes[i], iv).XORKeyStream(relays, relays[:index]) // make X25519 public key / ML-KEM-768 ciphertext distinguishable from random bytes
 		}
 		if lastCTR != nil {
 			lastCTR.XORKeyStream(relays, relays[:Hash256Length]) // make this relay irreplaceable
 		}
-		if i == len(c.NfsPKeys)-1 {
+		if i == len(c.nfsPKeys)-1 {
 			break
 		}
 		lastCTR = NewCTR(nfsKey, iv)
-		lastCTR.XORKeyStream(relays[index:], c.Hash32s[i+1][:])
+		lastCTR.XORKeyStream(relays[index:], c.hash32s[i+1][:])
 		relays = relays[index+Hash256Length:]
 	}
-	nfsAEAD := NewAEAD(iv, nfsKey, commonConn.UseAES)
+	nfsAEAD := NewAEAD(iv, nfsKey, commonConn.useAES)
 
-	if c.Seconds > 0 {
-		c.RWLock.RLock()
-		if c.timeFunc().Before(c.Expire) {
-			commonConn.Client = c
-			commonConn.UnitedKey = append(c.PfsKey, nfsKey...) // different unitedKey for each connection
+	if c.seconds > 0 {
+		c.ticketAccess.RLock()
+		if c.timeFunc().Before(c.expireAt) {
+			commonConn.client = c
+			commonConn.unitedKey = append(c.pfsKey, nfsKey...) // different unitedKey for each connection
 			nfsAEAD.Seal(clientHello.To(ivAndRelaysLength), nil, binary.BigEndian.AppendUint16(nil, EncryptedTicketLength), nil)
-			nfsAEAD.Seal(clientHello.To(ivAndRelaysLength+EncryptedLengthSize), nil, c.Ticket, nil)
-			c.RWLock.RUnlock()
-			commonConn.PreWrite = bytes.Clone(clientHello.To(ivAndRelaysLength + EncryptedLengthSize + EncryptedTicketLength))
-			commonConn.AEAD = NewAEAD(clientHello.Range(ivAndRelaysLength+EncryptedLengthSize, ivAndRelaysLength+EncryptedLengthSize+EncryptedTicketLength), commonConn.UnitedKey, commonConn.UseAES)
-			if c.XorMode == XorModeRandom {
-				commonConn.Conn = NewXorConn(conn, NewCTR(commonConn.UnitedKey, iv), nil, len(commonConn.PreWrite), IVLength)
+			nfsAEAD.Seal(clientHello.To(ivAndRelaysLength+EncryptedLengthSize), nil, c.ticket, nil)
+			c.ticketAccess.RUnlock()
+			commonConn.preWrite = bytes.Clone(clientHello.To(ivAndRelaysLength + EncryptedLengthSize + EncryptedTicketLength))
+			commonConn.aead = NewAEAD(clientHello.Range(ivAndRelaysLength+EncryptedLengthSize, ivAndRelaysLength+EncryptedLengthSize+EncryptedTicketLength), commonConn.unitedKey, commonConn.useAES)
+			if c.xorMode == XorModeRandom {
+				commonConn.conn = NewXorConn(conn, NewCTR(commonConn.unitedKey, iv), nil, len(commonConn.preWrite), IVLength)
 			}
 			return commonConn, nil
 		}
-		c.RWLock.RUnlock()
+		c.ticketAccess.RUnlock()
 	}
 
 	nfsAEAD.Seal(pfsKeyExchange[:0], nil, binary.BigEndian.AppendUint16(nil, uint16(PfsKeyExchangeLength-EncryptedLengthSize)), nil)
@@ -257,7 +248,10 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 	if err != nil {
 		return nil, err
 	}
-	nfsAEAD.Open(encryptedPfsPublicKey.Index(0), MaxNonce, encryptedPfsPublicKey.Bytes(), nil)
+	_, err = nfsAEAD.Open(encryptedPfsPublicKey.Index(0), MaxNonce, encryptedPfsPublicKey.Bytes(), nil)
+	if err != nil {
+		return nil, E.Cause(err, "open encryptedPfsPublicKey")
+	}
 	mlkem768Key, err := mlkem768DKey.Decapsulate(encryptedPfsPublicKey.To(mlkem.CiphertextSize768))
 	if err != nil {
 		return nil, err
@@ -271,39 +265,39 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 		return nil, err
 	}
 	pfsKey := append(mlkem768Key, x25519Key...)
-	commonConn.UnitedKey = append(pfsKey, nfsKey...)
-	commonConn.AEAD = NewAEAD(pfsPublicKey, commonConn.UnitedKey, commonConn.UseAES)
-	commonConn.PeerAEAD = NewAEAD(encryptedPfsPublicKey.To(mlkem.CiphertextSize768+X25519KeySize), commonConn.UnitedKey, commonConn.UseAES)
+	commonConn.unitedKey = append(pfsKey, nfsKey...)
+	commonConn.aead = NewAEAD(pfsPublicKey, commonConn.unitedKey, commonConn.useAES)
+	commonConn.peerAEAD = NewAEAD(encryptedPfsPublicKey.To(mlkem.CiphertextSize768+X25519KeySize), commonConn.unitedKey, commonConn.useAES)
 
 	encryptedTicket := make([]byte, EncryptedTicketLength)
 	if _, err := io.ReadFull(conn, encryptedTicket); err != nil {
 		return nil, err
 	}
-	if _, err := commonConn.PeerAEAD.Open(encryptedTicket[:0], nil, encryptedTicket, nil); err != nil {
+	if _, err := commonConn.peerAEAD.Open(encryptedTicket[:0], nil, encryptedTicket, nil); err != nil {
 		return nil, err
 	}
 	seconds := binary.BigEndian.Uint16(encryptedTicket)
 
-	if c.Seconds > 0 && seconds > 0 {
-		c.RWLock.Lock()
-		c.Expire = c.timeFunc().Add(time.Duration(seconds) * time.Second)
-		c.PfsKey = pfsKey
-		c.Ticket = encryptedTicket[:IVLength]
-		c.RWLock.Unlock()
+	if c.seconds > 0 && seconds > 0 {
+		c.ticketAccess.Lock()
+		c.expireAt = c.timeFunc().Add(time.Duration(seconds) * time.Second)
+		c.pfsKey = pfsKey
+		c.ticket = encryptedTicket[:IVLength]
+		c.ticketAccess.Unlock()
 	}
 
 	encryptedLength := make([]byte, EncryptedLengthSize)
 	if _, err := io.ReadFull(conn, encryptedLength); err != nil {
 		return nil, err
 	}
-	if _, err := commonConn.PeerAEAD.Open(encryptedLength[:0], nil, encryptedLength, nil); err != nil {
+	if _, err := commonConn.peerAEAD.Open(encryptedLength[:0], nil, encryptedLength, nil); err != nil {
 		return nil, err
 	}
 	length := binary.BigEndian.Uint16(encryptedLength[:2])
-	commonConn.PeerPadding = make([]byte, length) // important: allows server sends padding slowly, eliminating 1-RTT's traffic pattern
+	commonConn.peerPadding = make([]byte, length) // important: allows server sends padding slowly, eliminating 1-RTT's traffic pattern
 
-	if c.XorMode == XorModeRandom {
-		commonConn.Conn = NewXorConn(conn, NewCTR(commonConn.UnitedKey, iv), NewCTR(commonConn.UnitedKey, encryptedTicket[:IVLength]), 0, int(length))
+	if c.xorMode == XorModeRandom {
+		commonConn.conn = NewXorConn(conn, NewCTR(commonConn.unitedKey, iv), NewCTR(commonConn.unitedKey, encryptedTicket[:IVLength]), 0, int(length))
 	}
 	return commonConn, nil
 }
