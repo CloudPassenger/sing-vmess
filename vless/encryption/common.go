@@ -2,6 +2,7 @@ package encryption
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
@@ -58,6 +59,20 @@ var (
 
 	HasAESGCMHardwareSupport = hasGCMAsmAMD64 || hasGCMAsmARM64 || hasGCMAsmS390X || hasGCMAsmPPC64
 )
+
+type overrideAesKey struct{}
+
+func OverrideUseAes(ctx context.Context, useAes bool) context.Context {
+	return context.WithValue(ctx, overrideAesKey{}, useAes)
+}
+
+func useAesFromContext(ctx context.Context) bool {
+	value := ctx.Value(overrideAesKey{})
+	if value == nil {
+		return HasAESGCMHardwareSupport
+	}
+	return value.(bool)
+}
 
 var (
 	_ net.Conn             = (*CommonConn)(nil)

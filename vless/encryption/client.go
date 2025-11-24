@@ -33,6 +33,7 @@ const (
 )
 
 type Client struct {
+	useAes        bool
 	nfsPKeys      []any
 	nfsPKeysBytes [][]byte
 	hash32s       [][Hash256Length]byte
@@ -54,6 +55,7 @@ func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, sec
 		return nil, E.New("empty nfsPKeysBytes")
 	}
 	client = &Client{
+		useAes:        useAesFromContext(ctx),
 		nfsPKeys:      make([]any, len(nfsPKeysBytes)),
 		nfsPKeysBytes: nfsPKeysBytes,
 		hash32s:       make([][Hash256Length]byte, len(nfsPKeysBytes)),
@@ -151,7 +153,7 @@ func ParseEncryption(raw string) (xorMode XorMode, seconds uint32, nfsPKeysBytes
 }
 
 func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
-	commonConn = NewCommonConn(conn, HasAESGCMHardwareSupport)
+	commonConn = NewCommonConn(conn, c.useAes)
 
 	ivAndRelaysLength := IVLength + c.relaysLength
 	paddingLength, paddingLens, paddingGaps := createPadding(c.paddingLens, c.paddingGaps)
