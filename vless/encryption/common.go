@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
@@ -59,27 +60,28 @@ var (
 )
 
 var (
+	_ net.Conn             = (*CommonConn)(nil)
 	_ N.ReaderWithUpstream = (*CommonConn)(nil)
 	_ N.WriterWithUpstream = (*CommonConn)(nil)
 )
 
 type CommonConn struct {
-	net.Conn
-	UseAES      bool
-	Client      *Client
-	UnitedKey   []byte
-	PreWrite    []byte
-	AEAD        *AEAD
-	PeerAEAD    *AEAD
-	PeerPadding []byte
+	conn        net.Conn
+	useAES      bool
+	client      *Client
+	unitedKey   []byte
+	preWrite    []byte
+	aead        *AEAD
+	peerAEAD    *AEAD
+	peerPadding []byte
 	rawInput    bytes.Buffer // PeerInBytes
 	input       bytes.Reader // PeerCache
 }
 
 func NewCommonConn(conn net.Conn, useAES bool) *CommonConn {
 	return &CommonConn{
-		Conn:   conn,
-		UseAES: useAES,
+		conn:   conn,
+		useAES: useAES,
 	}
 }
 
@@ -98,18 +100,18 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 		headerAndData := outBytes[:HeaderLength+len(b)+AEADTagLength]
 		EncodeHeader(headerAndData, len(b)+AEADTagLength)
 		nonceGotMax := false
-		if bytes.Equal(c.AEAD.Nonce[:], MaxNonce) {
+		if bytes.Equal(c.aead.Nonce[:], MaxNonce) {
 			nonceGotMax = true
 		}
-		c.AEAD.Seal(headerAndData[:HeaderLength], nil, b, headerAndData[:HeaderLength])
+		c.aead.Seal(headerAndData[:HeaderLength], nil, b, headerAndData[:HeaderLength])
 		if nonceGotMax {
-			c.AEAD = NewAEAD(headerAndData, c.UnitedKey, c.UseAES)
+			c.aead = NewAEAD(headerAndData, c.unitedKey, c.useAES)
 		}
-		if c.PreWrite != nil {
-			headerAndData = append(c.PreWrite, headerAndData...)
-			c.PreWrite = nil
+		if c.preWrite != nil {
+			headerAndData = append(c.preWrite, headerAndData...)
+			c.preWrite = nil
 		}
-		if _, err := c.Conn.Write(headerAndData); err != nil {
+		if _, err := c.conn.Write(headerAndData); err != nil {
 			return 0, err
 		}
 	}
@@ -120,50 +122,50 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	if c.PeerAEAD == nil { // client's 0-RTT
+	if c.peerAEAD == nil { // client's 0-RTT
 		serverRandom := make([]byte, IVLength)
-		if _, err := io.ReadFull(c.Conn, serverRandom); err != nil {
+		if _, err := io.ReadFull(c.conn, serverRandom); err != nil {
 			return 0, err
 		}
-		c.PeerAEAD = NewAEAD(serverRandom, c.UnitedKey, c.UseAES)
-		if xorConn, isXorConn := c.Conn.(*XorConn); isXorConn {
-			xorConn.PeerCTR = NewCTR(c.UnitedKey, serverRandom)
+		c.peerAEAD = NewAEAD(serverRandom, c.unitedKey, c.useAES)
+		if xorConn, isXorConn := c.conn.(*XorConn); isXorConn {
+			xorConn.peerCTR = NewCTR(c.unitedKey, serverRandom)
 		}
 	}
-	if c.PeerPadding != nil { // client's 1-RTT
-		if _, err := io.ReadFull(c.Conn, c.PeerPadding); err != nil {
+	if c.peerPadding != nil { // client's 1-RTT
+		if _, err := io.ReadFull(c.conn, c.peerPadding); err != nil {
 			return 0, err
 		}
-		if _, err := c.PeerAEAD.Open(c.PeerPadding[:0], nil, c.PeerPadding, nil); err != nil {
+		if _, err := c.peerAEAD.Open(c.peerPadding[:0], nil, c.peerPadding, nil); err != nil {
 			return 0, err
 		}
-		c.PeerPadding = nil
+		c.peerPadding = nil
 	}
 	if c.input.Len() > 0 {
 		return c.input.Read(b)
 	}
 	peerHeader := [HeaderLength]byte{}
-	if _, err := io.ReadFull(c.Conn, peerHeader[:]); err != nil {
+	if _, err := io.ReadFull(c.conn, peerHeader[:]); err != nil {
 		return 0, err
 	}
 	l, err := DecodeHeader(peerHeader[:]) // l: 17~17000
 	if err != nil {
-		if c.Client != nil && E.IsMulti(err, ErrInvalidHeader) { // client's 0-RTT
-			c.Client.RWLock.Lock()
-			if bytes.HasPrefix(c.UnitedKey, c.Client.PfsKey) {
-				c.Client.Expire = c.Client.timeFunc() // expired
+		if c.client != nil && E.IsMulti(err, ErrInvalidHeader) { // client's 0-RTT
+			c.client.ticketAccess.Lock()
+			if bytes.HasPrefix(c.unitedKey, c.client.pfsKey) {
+				c.client.expireAt = c.client.timeFunc() // expired
 			}
-			c.Client.RWLock.Unlock()
+			c.client.ticketAccess.Unlock()
 			return 0, E.New("new handshake needed")
 		}
 		return 0, err
 	}
-	c.Client = nil
+	c.client = nil
 	if c.rawInput.Cap() < l {
 		c.rawInput.Grow(l) // no need to use sync.Pool, because we are always reading
 	}
 	peerData := c.rawInput.Bytes()[:l]
-	if _, err := io.ReadFull(c.Conn, peerData); err != nil {
+	if _, err := io.ReadFull(c.conn, peerData); err != nil {
 		return 0, err
 	}
 	dst := peerData[:l-AEADTagLength]
@@ -171,12 +173,12 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		dst = b[:len(dst)] // avoids another copy()
 	}
 	var newAEAD *AEAD
-	if bytes.Equal(c.PeerAEAD.Nonce[:], MaxNonce) {
-		newAEAD = NewAEAD(append(peerHeader[:], peerData...), c.UnitedKey, c.UseAES)
+	if bytes.Equal(c.peerAEAD.Nonce[:], MaxNonce) {
+		newAEAD = NewAEAD(append(peerHeader[:], peerData...), c.unitedKey, c.useAES)
 	}
-	_, err = c.PeerAEAD.Open(dst[:0], nil, peerData, peerHeader[:])
+	_, err = c.peerAEAD.Open(dst[:0], nil, peerData, peerHeader[:])
 	if newAEAD != nil {
-		c.PeerAEAD = newAEAD
+		c.peerAEAD = newAEAD
 	}
 	if err != nil {
 		return 0, E.Cause(err, "CommonConn: open dst")
@@ -188,6 +190,30 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 	return len(dst), nil
 }
 
+func (c *CommonConn) Close() error {
+	return common.Close(c.conn)
+}
+
+func (c *CommonConn) LocalAddr() net.Addr {
+	return c.conn.LocalAddr()
+}
+
+func (c *CommonConn) RemoteAddr() net.Addr {
+	return c.conn.RemoteAddr()
+}
+
+func (c *CommonConn) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
+}
+
+func (c *CommonConn) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
+
+func (c *CommonConn) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
+}
+
 func (c *CommonConn) WriterReplaceable() bool {
 	return false
 }
@@ -197,7 +223,7 @@ func (c *CommonConn) ReaderReplaceable() bool {
 }
 
 func (c *CommonConn) Upstream() any {
-	return c.Conn
+	return c.conn
 }
 
 type AEAD struct {
