@@ -89,29 +89,31 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	outBytes := buf.Get(HeaderLength + XrayBufferSize + AEADTagLength)
-	defer buf.Put(outBytes)
 	for n := 0; n < len(b); {
 		b := b[n:]
 		if len(b) > XrayBufferSize {
 			b = b[:XrayBufferSize] // for avoiding another copy() in peer's Read()
 		}
 		n += len(b)
-		headerAndData := outBytes[:HeaderLength+len(b)+AEADTagLength]
-		EncodeHeader(headerAndData, len(b)+AEADTagLength)
-		nonceGotMax := false
-		if bytes.Equal(c.aead.Nonce[:], MaxNonce) {
-			nonceGotMax = true
-		}
-		c.aead.Seal(headerAndData[:HeaderLength], nil, b, headerAndData[:HeaderLength])
-		if nonceGotMax {
-			c.aead = NewAEAD(headerAndData, c.unitedKey, c.useAES)
-		}
-		if c.preWrite != nil {
-			headerAndData = append(c.preWrite, headerAndData...)
+		headerAndData := buf.NewSize(len(c.preWrite) + HeaderLength + len(b) + c.aead.Overhead())
+		preWrite := c.preWrite
+		if preWrite != nil {
+			headerAndData.Write(preWrite)
 			c.preWrite = nil
 		}
-		if _, err := c.conn.Write(headerAndData); err != nil {
+		encodeHeader(headerAndData.Extend(HeaderLength), len(b)+c.aead.Overhead())
+		nonceGotMax := false
+		if bytes.Equal(c.aead.Nonce[:], maxNonce) {
+			nonceGotMax = true
+		}
+		c.aead.Seal(headerAndData.Index(len(preWrite)+HeaderLength), nil, b, headerAndData.Range(len(preWrite), len(preWrite)+HeaderLength))
+		headerAndData.Truncate(headerAndData.Cap())
+		if nonceGotMax {
+			c.aead = NewAEAD(headerAndData.Bytes(), c.unitedKey, c.useAES)
+		}
+		_, err := c.conn.Write(headerAndData.Bytes())
+		headerAndData.Release()
+		if err != nil {
 			return 0, err
 		}
 	}
@@ -148,7 +150,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 	if _, err := io.ReadFull(c.conn, peerHeader[:]); err != nil {
 		return 0, err
 	}
-	l, err := DecodeHeader(peerHeader[:]) // l: 17~17000
+	l, err := decodeHeader(peerHeader[:]) // l: 17~17000
 	if err != nil {
 		if c.client != nil && E.IsMulti(err, ErrInvalidHeader) { // client's 0-RTT
 			c.client.ticketAccess.Lock()
@@ -156,7 +158,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 				c.client.expireAt = c.client.timeFunc() // expired
 			}
 			c.client.ticketAccess.Unlock()
-			return 0, E.New("new handshake needed")
+			return 0, E.Extend(err, "new handshake needed")
 		}
 		return 0, err
 	}
@@ -173,7 +175,7 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		dst = b[:len(dst)] // avoids another copy()
 	}
 	var newAEAD *AEAD
-	if bytes.Equal(c.peerAEAD.Nonce[:], MaxNonce) {
+	if bytes.Equal(c.peerAEAD.Nonce[:], maxNonce) {
 		newAEAD = NewAEAD(append(peerHeader[:], peerData...), c.unitedKey, c.useAES)
 	}
 	_, err = c.peerAEAD.Open(dst[:0], nil, peerData, peerHeader[:])
@@ -226,8 +228,10 @@ func (c *CommonConn) Upstream() any {
 	return c.conn
 }
 
+var _ cipher.AEAD = (*AEAD)(nil)
+
 type AEAD struct {
-	cipher.AEAD
+	aead  cipher.AEAD
 	Nonce [NonceLength]byte
 }
 
@@ -241,24 +245,32 @@ func NewAEAD(ctx, key []byte, useAES bool) *AEAD {
 	} else {
 		aead, _ = chacha20poly1305.New(subkey)
 	}
-	return &AEAD{AEAD: aead}
+	return &AEAD{aead: aead}
 }
 
 func (a *AEAD) Seal(dst, nonce, plaintext, additionalData []byte) []byte {
 	if nonce == nil {
-		nonce = IncreaseNonce(a.Nonce[:])
+		nonce = increaseNonce(a.Nonce[:])
 	}
-	return a.AEAD.Seal(dst, nonce, plaintext, additionalData)
+	return a.aead.Seal(dst, nonce, plaintext, additionalData)
 }
 
 func (a *AEAD) Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error) {
 	if nonce == nil {
-		nonce = IncreaseNonce(a.Nonce[:])
+		nonce = increaseNonce(a.Nonce[:])
 	}
-	return a.AEAD.Open(dst, nonce, ciphertext, additionalData)
+	return a.aead.Open(dst, nonce, ciphertext, additionalData)
 }
 
-func IncreaseNonce(nonce []byte) []byte {
+func (a *AEAD) NonceSize() int {
+	return a.aead.NonceSize()
+}
+
+func (a *AEAD) Overhead() int {
+	return a.aead.Overhead()
+}
+
+func increaseNonce(nonce []byte) []byte {
 	for i := 0; i < NonceLength; i++ {
 		nonce[NonceLength-1-i]++
 		if nonce[NonceLength-1-i] != 0 {
@@ -268,9 +280,9 @@ func IncreaseNonce(nonce []byte) []byte {
 	return nonce
 }
 
-var MaxNonce = bytes.Repeat([]byte{0xFF}, NonceLength)
+var maxNonce = bytes.Repeat([]byte{0xFF}, NonceLength)
 
-func EncodeHeader(header []byte, length int) {
+func encodeHeader(header []byte, length int) {
 	header[0] = MagicHeaderByte0
 	header[1] = MagicHeaderByte1
 	header[2] = MagicHeaderByte2
@@ -279,10 +291,11 @@ func EncodeHeader(header []byte, length int) {
 
 var ErrInvalidHeader = E.New("invalid header")
 
-func DecodeHeader(header []byte) (length int, err error) {
+func decodeHeader(header []byte) (length int, err error) {
 	length = int(binary.BigEndian.Uint16(header[3:]))
 	if header[0] != MagicHeaderByte0 || header[1] != MagicHeaderByte1 || header[2] != MagicHeaderByte2 {
-		length = 0
+		err = ErrInvalidHeader
+		return
 	}
 	if length < MinPacketLength || length > MaxPacketLength { // TODO: TLSv1.3 max length
 		err = E.Extend(ErrInvalidHeader, fmt.Sprint(header[:HeaderLength])) // DO NOT CHANGE: relied by client's Read()
@@ -290,7 +303,7 @@ func DecodeHeader(header []byte) (length int, err error) {
 	return
 }
 
-func ParsePadding(padding []string) (paddingLens, paddingGaps [][3]int, err error) {
+func parsePadding(padding []string) (paddingLens, paddingGaps [][3]int, err error) {
 	if len(padding) == 0 {
 		return
 	}
@@ -329,7 +342,7 @@ func ParsePadding(padding []string) (paddingLens, paddingGaps [][3]int, err erro
 	return
 }
 
-func CreatePadding(paddingLens, paddingGaps [][3]int) (length int, lens []int, gaps []time.Duration) {
+func createPadding(paddingLens, paddingGaps [][3]int) (length int, lens []int, gaps []time.Duration) {
 	if len(paddingLens) == 0 {
 		paddingLens = [][3]int{{100, 111, 1111}, {50, 0, 3333}}
 		paddingGaps = [][3]int{{75, 0, 111}}

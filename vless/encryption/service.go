@@ -93,7 +93,7 @@ func NewService(ctx context.Context, nfsSKeysBytes [][]byte, xorMode XorMode, se
 	}
 	service.relaysLength -= Hash256Length
 	var err error
-	service.paddingLens, service.paddingGaps, err = ParsePadding(padding)
+	service.paddingLens, service.paddingGaps, err = parsePadding(padding)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +338,7 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 			var err error
 			for err == nil {
 				rand.Read(header)
-				_, err = DecodeHeader(header)
+				_, err = decodeHeader(header)
 			}
 			noises.Truncate(HeaderLength)
 			noises.ReadFullFrom(rand.Reader, noises.FreeLen())
@@ -409,10 +409,10 @@ func (s *Service) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error
 		s.sessionAccess.Unlock()
 	}
 
-	paddingLength, paddingLens, paddingGaps := CreatePadding(s.paddingLens, s.paddingGaps)
+	paddingLength, paddingLens, paddingGaps := createPadding(s.paddingLens, s.paddingGaps)
 	serverHello := buf.NewSize(EncryptedPfsPublicKeyLength + EncryptedTicketLength + paddingLength)
 	defer serverHello.Release()
-	nfsAead.Seal(serverHello.Index(0), MaxNonce, pfsPublicKey, nil)
+	nfsAead.Seal(serverHello.Index(0), maxNonce, pfsPublicKey, nil)
 	commonConn.aead.Seal(serverHello.Index(EncryptedPfsPublicKeyLength), nil, ticket[:], nil)
 	const paddingIndex = EncryptedPfsPublicKeyLength + EncryptedTicketLength
 	commonConn.aead.Seal(serverHello.Index(paddingIndex), nil, binary.BigEndian.AppendUint16(nil, uint16(paddingLength-18)), nil)

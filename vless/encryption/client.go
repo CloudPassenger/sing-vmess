@@ -82,7 +82,7 @@ func NewClient(ctx context.Context, nfsPKeysBytes [][]byte, xorMode XorMode, sec
 		client.hash32s[i] = blake3.Sum256(keysByte)
 	}
 	client.relaysLength -= Hash256Length
-	client.paddingLens, client.paddingGaps, err = ParsePadding(paddings)
+	client.paddingLens, client.paddingGaps, err = parsePadding(paddings)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +154,7 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 	commonConn = NewCommonConn(conn, HasAESGCMHardwareSupport)
 
 	ivAndRelaysLength := IVLength + c.relaysLength
-	paddingLength, paddingLens, paddingGaps := CreatePadding(c.paddingLens, c.paddingGaps)
+	paddingLength, paddingLens, paddingGaps := createPadding(c.paddingLens, c.paddingGaps)
 	clientHello := buf.NewSize(ivAndRelaysLength + PfsKeyExchangeLength + paddingLength)
 	defer clientHello.Release()
 
@@ -248,7 +248,7 @@ func (c *Client) Handshake(conn net.Conn) (commonConn *CommonConn, err error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = nfsAEAD.Open(encryptedPfsPublicKey.Index(0), MaxNonce, encryptedPfsPublicKey.Bytes(), nil)
+	_, err = nfsAEAD.Open(encryptedPfsPublicKey.Index(0), maxNonce, encryptedPfsPublicKey.Bytes(), nil)
 	if err != nil {
 		return nil, E.Cause(err, "open encryptedPfsPublicKey")
 	}

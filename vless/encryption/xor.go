@@ -74,7 +74,7 @@ func (c *XorConn) Write(b []byte) (int, error) {
 			c.ctr.XORKeyStream(p, p)
 			break
 		}
-		c.outSkip, _ = DecodeHeader(append(c.outHeader, p[:need]...))
+		c.outSkip, _ = decodeHeader(append(c.outHeader, p[:need]...))
 		c.outHeader = c.outHeader[:0]
 		c.ctr.XORKeyStream(p[:need], p[:need])
 		p = p[need:]
@@ -104,7 +104,7 @@ func (c *XorConn) Read(b []byte) (int, error) {
 			break
 		}
 		c.peerCTR.XORKeyStream(p[:need], p[:need])
-		c.inSkip, _ = DecodeHeader(append(c.inHeader, p[:need]...))
+		c.inSkip, _ = decodeHeader(append(c.inHeader, p[:need]...))
 		c.inHeader = c.inHeader[:0]
 		p = p[need:]
 	}
