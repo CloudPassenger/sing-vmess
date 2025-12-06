@@ -71,10 +71,15 @@ func NewVisionConn(conn net.Conn, tlsConn net.Conn, userUUID [16]byte, logger lo
 		netConn        net.Conn
 	)
 	if encryptedConn, isEncryptedConn := common.Cast[*encryption.CommonConn](conn); isEncryptedConn {
-		loaded = true
-		reflectType = reflect.TypeOf(encryptedConn).Elem()
-		reflectPointer = uintptr(unsafe.Pointer(encryptedConn))
-		netConn = encryptedConn.Upstream().(net.Conn)
+		upstream := encryptedConn.Upstream()
+		_, isXorConn := upstream.(*encryption.XorConn)
+		// full-random xorConn should not be penetrated
+		if !isXorConn {
+			loaded = true
+			reflectType = reflect.TypeOf(encryptedConn).Elem()
+			reflectPointer = uintptr(unsafe.Pointer(encryptedConn))
+			netConn = upstream.(net.Conn)
+		}
 	} else {
 		for _, tlsCreator := range tlsRegistry {
 			loaded, netConn, reflectType, reflectPointer = tlsCreator(tlsConn)
