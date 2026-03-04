@@ -36,14 +36,14 @@ const (
 	IVLength            = 16 // Initialization Vector length
 	NonceLength         = 12 // AEAD nonce length
 	TicketLength        = 16
-	AEADTagLength       = 16    // AEAD authentication tag length
-	Hash256Length       = 32    // BLAKE3 hash length
-	EncryptedLengthSize = 18    // 2-byte length + 16-byte tag
-	XrayBufferSize      = 8192  // Xray buffer size
-	MinPacketLength     = 17    // Minimum packet length (1 byte data + 16 byte tag)
-	MaxPacketLength     = 17000 // Maximum packet length
-	MinPaddingLength    = 35    // Minimum first padding length (18+17)
-	MaxTotalPadding     = 65553 // Maximum total padding length (18+65535)
+	AEADTagLength       = 16          // AEAD authentication tag length
+	Hash256Length       = 32          // BLAKE3 hash length
+	EncryptedLengthSize = 18          // 2-byte length + 16-byte tag
+	XrayBufferSize      = 8192        // Xray buffer size
+	MinPacketLength     = 17          // Minimum packet length (1 byte data + 16 byte tag)
+	MaxPacketLength     = 16384 + 256 // TLS 1.3 max record: 16384 + 256 = 16640 (RFC 8446 §5.2)
+	MinPaddingLength    = 35          // Minimum first padding length (18+17)
+	MaxTotalPadding     = 65553       // Maximum total padding length (18+65535)
 
 	Challenge = "VLESS"
 
@@ -321,7 +321,7 @@ func decodeHeader(header []byte) (length int, err error) {
 		err = ErrInvalidHeader
 		return
 	}
-	if length < MinPacketLength || length > MaxPacketLength { // TODO: TLSv1.3 max length
+	if length < MinPacketLength || length > MaxPacketLength {
 		err = E.Extend(ErrInvalidHeader, fmt.Sprint(header[:HeaderLength])) // DO NOT CHANGE: relied by client's Read()
 	}
 	return
