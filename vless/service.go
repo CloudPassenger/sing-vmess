@@ -71,6 +71,9 @@ func (s *Service[T]) Start() error {
 }
 
 func (s *Service[T]) Close() error {
+	if s == nil || s.decryption == nil {
+		return nil
+	}
 	return common.Close(s.decryption)
 }
 
