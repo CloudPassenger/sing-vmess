@@ -33,6 +33,7 @@ type ServiceSession struct {
 type Service struct {
 	ctx    context.Context
 	closed chan struct{}
+	close  sync.Once
 
 	nfsSKeys      []any
 	nfsPKeysBytes [][]byte
@@ -215,11 +216,17 @@ func (s *Service) allow0Rtt() bool {
 }
 
 func (s *Service) Close() error {
-	s.sessionAccess.Lock()
-	defer s.sessionAccess.Unlock()
-	if s.closed != nil {
-		close(s.closed)
+	if s == nil {
+		return nil
 	}
+	s.close.Do(func() {
+		s.sessionAccess.Lock()
+		defer s.sessionAccess.Unlock()
+		if s.closed != nil {
+			close(s.closed)
+			s.closed = nil
+		}
+	})
 	return nil
 }
 
