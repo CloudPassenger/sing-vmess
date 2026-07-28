@@ -13,6 +13,8 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -42,32 +44,60 @@ var (
 	ErrBadVersion   = E.New("bad version")
 )
 
+const legacyUserRefreshInterval = 10 * time.Second
+
 type Service[U comparable] struct {
-	userKey              map[U][16]byte
-	userIdCipher         map[U]cipher.Block
+	state                atomic.Pointer[serviceState[U]]
 	replayFilter         replay.Filter
 	handler              Handler
 	time                 func() time.Time
 	disableHeaderProtect bool
-	alterIds             map[U][][16]byte
-	alterIdUpdateTime    map[U]int64
-	alterIdMap           map[[16]byte]legacyUserEntry[U]
-	alterIdUpdateTask    *time.Ticker
-	alterIdUpdateDone    chan struct{}
+	refreshInterval      time.Duration
+	lifecycleAccess      sync.Mutex
+	refreshStop          chan struct{}
+	refreshDone          chan struct{}
+	started              bool
+	closed               bool
+}
+
+type serviceState[U comparable] struct {
+	users             []serviceUser[U]
+	alterIDUpdateTime []int64
+	legacyUserMap     map[[16]byte]legacyUserEntry[U]
+	hasAlterIDs       bool
+}
+
+type serviceUser[U comparable] struct {
+	user         U
+	commandKey   [16]byte
+	authIDCipher cipher.Block
+	alterIDs     [][16]byte
 }
 
 type legacyUserEntry[U comparable] struct {
-	User  U
-	Time  int64
-	Index int
+	User       U
+	CommandKey [16]byte
+	Time       int64
+	Index      int
+}
+
+// PreparedUsers contains one complete immutable VMess authentication state.
+type PreparedUsers[U comparable] struct {
+	state *serviceState[U]
 }
 
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
 	service := &Service[U]{
-		replayFilter: replay.NewSimple(time.Second * 120),
-		handler:      handler,
-		time:         time.Now,
+		replayFilter:    replay.NewSimple(time.Second * 120),
+		handler:         handler,
+		time:            time.Now,
+		refreshInterval: legacyUserRefreshInterval,
 	}
+	service.state.Store(&serviceState[U]{
+		users:             make([]serviceUser[U], 0),
+		alterIDUpdateTime: make([]int64, 0),
+		legacyUserMap:     make(map[[16]byte]legacyUserEntry[U]),
+	})
 	anyService := (*Service[string])(unsafe.Pointer(service))
 	for _, option := range options {
 		option(anyService)
@@ -75,104 +105,210 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 	return service
 }
 
-func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList []int) error {
-	userKeyMap := make(map[U][16]byte)
-	userIdCipherMap := make(map[U]cipher.Block)
-	userAlterIds := make(map[U][][16]byte)
-	for i, user := range userList {
-		userId := userIdList[i]
-		userUUID, err := uuid.FromString(userId)
-		if err != nil {
-			userUUID = uuid.NewV5(uuid.Nil, userId)
-		}
-		userCmdKey := Key(userUUID)
-		userKeyMap[user] = userCmdKey
-		userIdCipher, err := aes.NewCipher(KDF(userCmdKey[:], KDFSaltConstAuthIDEncryptionKey)[:16])
-		if err != nil {
-			return err
-		}
-		userIdCipherMap[user] = userIdCipher
-		alterId := alterIdList[i]
-		if alterId > 0 {
-			alterIds := make([][16]byte, 0, alterId)
-			currentId := userUUID
-			for j := 0; j < alterId; j++ {
-				currentId = AlterId(currentId)
-				alterIds = append(alterIds, currentId)
-			}
-			userAlterIds[user] = alterIds
-		}
+func (s *Service[U]) UpdateUsers(userList []U, userIDList []string, alterIDList []int) error {
+	prepared, err := s.PrepareUsers(userList, userIDList, alterIDList)
+	if err != nil {
+		return err
 	}
-	s.userKey = userKeyMap
-	s.userIdCipher = userIdCipherMap
-	s.alterIds = userAlterIds
-	s.alterIdUpdateTime = make(map[U]int64)
-	s.generateLegacyKeys()
+	s.InstallUsers(prepared)
 	return nil
 }
 
-func (s *Service[U]) Start() error {
-	const updateInterval = 10 * time.Second
-	if len(s.alterIds) > 0 {
-		s.alterIdUpdateTask = time.NewTicker(updateInterval)
-		s.alterIdUpdateDone = make(chan struct{})
-		go s.loopGenerateLegacyKeys()
+// PrepareUsers validates and compiles one complete immutable VMess user state.
+func (s *Service[U]) PrepareUsers(
+	userList []U,
+	userIDList []string,
+	alterIDList []int,
+) (*PreparedUsers[U], error) {
+	if len(userList) != len(userIDList) || len(userList) != len(alterIDList) {
+		return nil, E.New("invalid VMess user list lengths")
 	}
+
+	users := make([]serviceUser[U], 0, len(userList))
+	credentialSet := make(map[uuid.UUID]struct{}, len(userList))
+	var hasAlterIDs bool
+	for index, user := range userList {
+		userUUID, err := uuid.FromString(userIDList[index])
+		if err != nil {
+			userUUID = uuid.NewV5(uuid.Nil, userIDList[index])
+		}
+		if _, loaded := credentialSet[userUUID]; loaded {
+			return nil, E.New("duplicate VMess UUID credential")
+		}
+		credentialSet[userUUID] = struct{}{}
+
+		alterID := alterIDList[index]
+		if alterID < 0 {
+			return nil, E.New("invalid VMess alter ID at user index ", index)
+		}
+
+		commandKey := Key(userUUID)
+		authIDCipher, err := aes.NewCipher(KDF(commandKey[:], KDFSaltConstAuthIDEncryptionKey)[:16])
+		if err != nil {
+			return nil, E.Cause(err, "create VMess authentication cipher")
+		}
+
+		alterIDs := make([][16]byte, 0, alterID)
+		currentID := userUUID
+		for range alterID {
+			currentID = AlterId(currentID)
+			alterIDs = append(alterIDs, currentID)
+		}
+		if alterID > 0 {
+			hasAlterIDs = true
+		}
+
+		users = append(users, serviceUser[U]{
+			user:         user,
+			commandKey:   commandKey,
+			authIDCipher: authIDCipher,
+			alterIDs:     alterIDs,
+		})
+	}
+
+	state := &serviceState[U]{
+		users:             users,
+		alterIDUpdateTime: make([]int64, len(users)),
+		legacyUserMap:     make(map[[16]byte]legacyUserEntry[U]),
+		hasAlterIDs:       hasAlterIDs,
+	}
+	if hasAlterIDs {
+		state = buildLegacyUserState(state, s.time().Unix())
+	}
+	return &PreparedUsers[U]{state: state}, nil
+}
+
+// InstallUsers atomically publishes a prepared VMess authentication state.
+func (s *Service[U]) InstallUsers(prepared *PreparedUsers[U]) {
+	if prepared == nil || prepared.state == nil {
+		return
+	}
+	s.state.Store(prepared.state)
+}
+
+func (s *Service[U]) Start() error {
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	if s.started || s.closed {
+		return nil
+	}
+
+	refreshInterval := s.refreshInterval
+	if refreshInterval <= 0 {
+		refreshInterval = legacyUserRefreshInterval
+	}
+	s.refreshStop = make(chan struct{})
+	s.refreshDone = make(chan struct{})
+	s.started = true
+	go s.loopGenerateLegacyKeys(refreshInterval, s.refreshStop, s.refreshDone)
 	return nil
 }
 
 func (s *Service[U]) Close() error {
-	if s.alterIdUpdateTask != nil {
-		s.alterIdUpdateTask.Stop()
-		close(s.alterIdUpdateDone)
+	s.lifecycleAccess.Lock()
+	if s.closed {
+		refreshDone := s.refreshDone
+		s.lifecycleAccess.Unlock()
+		if refreshDone != nil {
+			<-refreshDone
+		}
+		return nil
+	}
+	s.closed = true
+	refreshStop := s.refreshStop
+	refreshDone := s.refreshDone
+	s.lifecycleAccess.Unlock()
+
+	if refreshStop != nil {
+		close(refreshStop)
+	}
+	if refreshDone != nil {
+		<-refreshDone
 	}
 	return nil
 }
 
-func (s *Service[U]) loopGenerateLegacyKeys() {
+// The lifecycle goroutine remains until Close, but a state without alter IDs
+// makes every refresh tick a lock-free, allocation-free no-op.
+func (s *Service[U]) loopGenerateLegacyKeys(
+	refreshInterval time.Duration,
+	refreshStop <-chan struct{},
+	refreshDone chan<- struct{},
+) {
+	refreshTicker := time.NewTicker(refreshInterval)
+	defer refreshTicker.Stop()
+	defer close(refreshDone)
 	for {
 		select {
-		case <-s.alterIdUpdateDone:
+		case <-refreshStop:
 			return
-		case <-s.alterIdUpdateTask.C:
+		case <-refreshTicker.C:
+			s.refreshLegacyKeys()
 		}
-		s.generateLegacyKeys()
 	}
 }
 
-func (s *Service[U]) generateLegacyKeys() {
-	nowSec := s.time().Unix()
+func (s *Service[U]) refreshLegacyKeys() bool {
+	currentState := s.state.Load()
+	if currentState == nil || !currentState.hasAlterIDs {
+		return false
+	}
+	return s.refreshLegacyKeysFrom(currentState, s.time().Unix())
+}
+
+func (s *Service[U]) refreshLegacyKeysFrom(currentState *serviceState[U], nowSec int64) bool {
+	if currentState == nil || !currentState.hasAlterIDs {
+		return false
+	}
+	updatedState := buildLegacyUserState(currentState, nowSec)
+	return s.state.CompareAndSwap(currentState, updatedState)
+}
+
+func buildLegacyUserState[U comparable](currentState *serviceState[U], nowSec int64) *serviceState[U] {
 	endSec := nowSec + CacheDurationSeconds
+	legacyUserMap := make(map[[16]byte]legacyUserEntry[U])
+	alterIDUpdateTime := make([]int64, len(currentState.users))
 	var hashValue [16]byte
 
-	userAlterIdMap := make(map[[16]byte]legacyUserEntry[U])
-	userAlterIdUpdateTime := make(map[U]int64)
-
-	for user, alterIds := range s.alterIds {
-		beginSec := s.alterIdUpdateTime[user]
+	for userIndex, user := range currentState.users {
+		if len(user.alterIDs) == 0 {
+			continue
+		}
+		beginSec := currentState.alterIDUpdateTime[userIndex]
 		if beginSec < nowSec-CacheDurationSeconds {
 			beginSec = nowSec - CacheDurationSeconds
 		}
-		for i, alterId := range alterIds {
-			idHash := hmac.New(md5.New, alterId[:])
-			for ts := beginSec; ts <= endSec; ts++ {
-				common.Must(binary.Write(idHash, binary.BigEndian, uint64(ts)))
+		for alterIDIndex, alterID := range user.alterIDs {
+			idHash := hmac.New(md5.New, alterID[:])
+			for timestamp := beginSec; timestamp <= endSec; timestamp++ {
+				common.Must(binary.Write(idHash, binary.BigEndian, uint64(timestamp)))
 				idHash.Sum(hashValue[:0])
 				idHash.Reset()
-				userAlterIdMap[hashValue] = legacyUserEntry[U]{user, ts, i}
+				legacyUserMap[hashValue] = legacyUserEntry[U]{
+					User:       user.user,
+					CommandKey: user.commandKey,
+					Time:       timestamp,
+					Index:      alterIDIndex,
+				}
 			}
 		}
-		userAlterIdUpdateTime[user] = nowSec
+		alterIDUpdateTime[userIndex] = nowSec
 	}
-	s.alterIdUpdateTime = userAlterIdUpdateTime
-	s.alterIdMap = userAlterIdMap
+
+	return &serviceState[U]{
+		users:             currentState.users,
+		alterIDUpdateTime: alterIDUpdateTime,
+		legacyUserMap:     legacyUserMap,
+		hasAlterIDs:       currentState.hasAlterIDs,
+	}
 }
 
 func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+	state := s.state.Load()
 	const headerLenBufferLen = 2 + CipherOverhead
 	const aeadMinHeaderLen = 16 + headerLenBufferLen + 8 + CipherOverhead + 42
 	minHeaderLen := aeadMinHeaderLen
-	if len(s.alterIds) > 0 {
+	if state.hasAlterIDs {
 		minHeaderLen = 16 + 38
 	}
 
@@ -195,23 +331,26 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 
 	authId := requestBuffer.To(16)
-	var decodedId [16]byte
+	var decodedID [16]byte
 	var user U
+	var commandKey [16]byte
 	var found bool
-	for currUser, userIdBlock := range s.userIdCipher {
-		userIdBlock.Decrypt(decodedId[:], authId)
-		timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
-		checksum := binary.BigEndian.Uint32(decodedId[12:])
-		if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
+	nowSec := s.time().Unix()
+	for _, currentUser := range state.users {
+		currentUser.authIDCipher.Decrypt(decodedID[:], authId)
+		timestamp := int64(binary.BigEndian.Uint64(decodedID[:]))
+		checksum := binary.BigEndian.Uint32(decodedID[12:])
+		if crc32.ChecksumIEEE(decodedID[:12]) != checksum {
 			continue
 		}
-		if math.Abs(math.Abs(float64(timestamp))-float64(time.Now().Unix())) > 120 {
+		if math.Abs(math.Abs(float64(timestamp))-float64(nowSec)) > 120 {
 			return ErrBadTimestamp
 		}
-		if !s.replayFilter.Check(decodedId[:]) {
+		if !s.replayFilter.Check(decodedID[:]) {
 			return ErrReplay
 		}
-		user = currUser
+		user = currentUser.user
+		commandKey = currentUser.commandKey
 		found = true
 		break
 	}
@@ -219,12 +358,13 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	var legacyProtocol bool
 	var legacyTimestamp uint64
 	if !found {
-		copy(decodedId[:], authId)
-		if currUser, loaded := s.alterIdMap[decodedId]; loaded {
+		copy(decodedID[:], authId)
+		if currentUser, loaded := state.legacyUserMap[decodedID]; loaded {
 			found = true
 			legacyProtocol = true
-			user = currUser.User
-			legacyTimestamp = uint64(currUser.Time)
+			user = currentUser.User
+			commandKey = currentUser.CommandKey
+			legacyTimestamp = uint64(currentUser.Time)
 		}
 	}
 	if !found {
@@ -232,7 +372,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 
 	ctx = auth.ContextWithUser(ctx, user)
-	cmdKey := s.userKey[user]
+	cmdKey := commandKey
 	var headerReader io.Reader
 	var headerBuffer []byte
 
@@ -247,7 +387,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
-		userKey := s.userKey[user]
+		userKey := commandKey
 		headerReader = NewStreamReader(reader, userKey[:], timeHash.Sum(nil))
 		headerBuffer = make([]byte, 38)
 		_, err = io.ReadFull(headerReader, headerBuffer)

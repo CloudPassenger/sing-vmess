@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing-vmess/vless/encryption"
@@ -20,11 +21,23 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
+type userEntry[T comparable] struct {
+	user T
+	flow string
+}
+
+type userState[T comparable] struct {
+	userMap map[[16]byte]userEntry[T]
+}
+
+type PreparedUsers[T comparable] struct {
+	state *userState[T]
+}
+
 type Service[T comparable] struct {
-	userMap  map[[16]byte]T
-	userFlow map[T]string
-	logger   logger.Logger
-	handler  Handler
+	users   atomic.Pointer[userState[T]]
+	logger  logger.Logger
+	handler Handler
 
 	decryption *encryption.Service
 }
@@ -48,12 +61,16 @@ func NewService[T comparable](ctx context.Context, decryptionOptions string, log
 			return nil, E.Cause(err, "create decryption")
 		}
 	}
-	return &Service[T]{
+	service := &Service[T]{
 		logger:  logger,
 		handler: handler,
 
 		decryption: decryption,
-	}, nil
+	}
+	service.users.Store(&userState[T]{
+		userMap: make(map[[16]byte]userEntry[T]),
+	})
+	return service, nil
 }
 
 func (s *Service[T]) Start() error {
@@ -77,19 +94,44 @@ func (s *Service[T]) Close() error {
 	return common.Close(s.decryption)
 }
 
-func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowList []string) {
-	userMap := make(map[[16]byte]T)
-	userFlowMap := make(map[T]string)
-	for i, userName := range userList {
-		userID, err := uuid.FromString(userUUIDList[i])
-		if err != nil {
-			userID = uuid.NewV5(uuid.Nil, userUUIDList[i])
-		}
-		userMap[userID] = userName
-		userFlowMap[userName] = userFlowList[i]
+func (s *Service[T]) PrepareUsers(userList []T, userUUIDList []string, userFlowList []string) (*PreparedUsers[T], error) {
+	if len(userList) != len(userUUIDList) || len(userList) != len(userFlowList) {
+		return nil, E.New("mismatched VLESS user list lengths")
 	}
-	s.userMap = userMap
-	s.userFlow = userFlowMap
+	userMap := make(map[[16]byte]userEntry[T], len(userList))
+	for index, user := range userList {
+		userFlow := userFlowList[index]
+		switch userFlow {
+		case "", FlowVision:
+		default:
+			return nil, E.New("unsupported VLESS flow at user index ", index)
+		}
+		userUUID := normalizeUserUUID(userUUIDList[index])
+		if _, loaded := userMap[userUUID]; loaded {
+			return nil, E.New("duplicate VLESS UUID credential at user index ", index)
+		}
+		userMap[userUUID] = userEntry[T]{
+			user: user,
+			flow: userFlow,
+		}
+	}
+	return &PreparedUsers[T]{
+		state: &userState[T]{
+			userMap: userMap,
+		},
+	}, nil
+}
+
+func (s *Service[T]) InstallUsers(users *PreparedUsers[T]) {
+	s.users.Store(users.state)
+}
+
+func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowList []string) {
+	users, err := s.PrepareUsers(userList, userUUIDList, userFlowList)
+	if err != nil {
+		return
+	}
+	s.InstallUsers(users)
 }
 
 func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
@@ -105,12 +147,13 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	if err != nil {
 		return err
 	}
-	user, loaded := s.userMap[request.UUID]
+	state := s.users.Load()
+	entry, loaded := state.userMap[request.UUID]
 	if !loaded {
-		return E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:]))
+		return E.New("unknown UUID")
 	}
-	ctx = auth.ContextWithUser(ctx, user)
-	userFlow := s.userFlow[user]
+	ctx = auth.ContextWithUser(ctx, entry.user)
+	userFlow := entry.flow
 	if request.Flow == FlowVision && request.Command == vmess.NetworkUDP {
 		return E.New(FlowVision, " flow does not support UDP")
 	} else if request.Flow != userFlow {
@@ -149,6 +192,14 @@ func flowName(value string) string {
 		return "none"
 	}
 	return value
+}
+
+func normalizeUserUUID(value string) [16]byte {
+	userID, err := uuid.FromString(value)
+	if err != nil {
+		userID = uuid.NewV5(uuid.Nil, value)
+	}
+	return userID
 }
 
 type serverConn struct {
