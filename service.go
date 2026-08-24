@@ -81,11 +81,6 @@ type legacyUserEntry[U comparable] struct {
 	Index      int
 }
 
-// PreparedUsers contains one complete immutable VMess authentication state.
-type PreparedUsers[U comparable] struct {
-	state *serviceState[U]
-}
-
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
 	service := &Service[U]{
 		replayFilter:    replay.NewSimple(time.Second * 120),
@@ -105,56 +100,36 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 	return service
 }
 
+// UpdateUsers compiles one complete immutable authentication state and publishes
+// it with a single atomic store, so concurrent handshakes never observe a
+// partially applied user set.
 func (s *Service[U]) UpdateUsers(userList []U, userIDList []string, alterIDList []int) error {
-	prepared, err := s.PrepareUsers(userList, userIDList, alterIDList)
-	if err != nil {
-		return err
-	}
-	s.InstallUsers(prepared)
-	return nil
-}
-
-// PrepareUsers validates and compiles one complete immutable VMess user state.
-func (s *Service[U]) PrepareUsers(
-	userList []U,
-	userIDList []string,
-	alterIDList []int,
-) (*PreparedUsers[U], error) {
 	if len(userList) != len(userIDList) || len(userList) != len(alterIDList) {
-		return nil, E.New("invalid VMess user list lengths")
+		return E.New("invalid VMess user list lengths")
 	}
 
 	users := make([]serviceUser[U], 0, len(userList))
-	credentialSet := make(map[uuid.UUID]struct{}, len(userList))
 	var hasAlterIDs bool
 	for index, user := range userList {
 		userUUID, err := uuid.FromString(userIDList[index])
 		if err != nil {
 			userUUID = uuid.NewV5(uuid.Nil, userIDList[index])
 		}
-		if _, loaded := credentialSet[userUUID]; loaded {
-			return nil, E.New("duplicate VMess UUID credential")
-		}
-		credentialSet[userUUID] = struct{}{}
-
-		alterID := alterIDList[index]
-		if alterID < 0 {
-			return nil, E.New("invalid VMess alter ID at user index ", index)
-		}
 
 		commandKey := Key(userUUID)
 		authIDCipher, err := aes.NewCipher(KDF(commandKey[:], KDFSaltConstAuthIDEncryptionKey)[:16])
 		if err != nil {
-			return nil, E.Cause(err, "create VMess authentication cipher")
+			return E.Cause(err, "create VMess authentication cipher")
 		}
 
-		alterIDs := make([][16]byte, 0, alterID)
-		currentID := userUUID
-		for range alterID {
-			currentID = AlterId(currentID)
-			alterIDs = append(alterIDs, currentID)
-		}
-		if alterID > 0 {
+		var alterIDs [][16]byte
+		if alterID := alterIDList[index]; alterID > 0 {
+			alterIDs = make([][16]byte, 0, alterID)
+			currentID := userUUID
+			for range alterID {
+				currentID = AlterId(currentID)
+				alterIDs = append(alterIDs, currentID)
+			}
 			hasAlterIDs = true
 		}
 
@@ -175,15 +150,8 @@ func (s *Service[U]) PrepareUsers(
 	if hasAlterIDs {
 		state = buildLegacyUserState(state, s.time().Unix())
 	}
-	return &PreparedUsers[U]{state: state}, nil
-}
-
-// InstallUsers atomically publishes a prepared VMess authentication state.
-func (s *Service[U]) InstallUsers(prepared *PreparedUsers[U]) {
-	if prepared == nil || prepared.state == nil {
-		return
-	}
-	s.state.Store(prepared.state)
+	s.state.Store(state)
+	return nil
 }
 
 func (s *Service[U]) Start() error {
