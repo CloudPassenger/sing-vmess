@@ -114,7 +114,7 @@ func authenticateService(
 	}
 }
 
-func TestServicePreparedUsersAtomicPublication(t *testing.T) {
+func TestServiceUpdateUsersAtomicPublication(t *testing.T) {
 	t.Parallel()
 	service, handler := newServiceTest(t)
 	const (
@@ -122,65 +122,39 @@ func TestServicePreparedUsersAtomicPublication(t *testing.T) {
 		newUUID = "22222222-2222-4222-8222-222222222222"
 	)
 
-	oldUsers, err := service.PrepareUsers(
-		[]string{"old-user"},
-		[]string{oldUUID},
-		[]string{""},
-	)
-	if err != nil {
-		t.Fatalf("PrepareUsers(old) error = %v", err)
-	}
-	service.InstallUsers(oldUsers)
-
-	newUsers, err := service.PrepareUsers(
-		[]string{"new-user"},
-		[]string{newUUID},
-		[]string{""},
-	)
-	if err != nil {
-		t.Fatalf("PrepareUsers(new) error = %v", err)
-	}
+	service.UpdateUsers([]string{"old-user"}, []string{oldUUID}, []string{""})
 
 	observation, err := authenticateService(service, handler, oldUUID, "")
 	if err != nil {
-		t.Fatalf("old user before install error = %v", err)
+		t.Fatalf("old user error = %v", err)
 	}
 	if !observation.loaded || observation.user != "old-user" {
-		t.Fatalf("old user before install = %+v", observation)
+		t.Fatalf("old user = %+v", observation)
 	}
 	if _, err = authenticateService(service, handler, newUUID, ""); err == nil {
-		t.Fatal("prepared state became visible before InstallUsers")
+		t.Fatal("unpublished credential authenticated")
 	}
 
-	service.InstallUsers(newUsers)
+	service.UpdateUsers([]string{"new-user"}, []string{newUUID}, []string{""})
 	if _, err = authenticateService(service, handler, oldUUID, ""); err == nil {
-		t.Fatal("old state remained visible after InstallUsers")
+		t.Fatal("replaced credential still authenticates")
 	}
 	observation, err = authenticateService(service, handler, newUUID, "")
 	if err != nil {
-		t.Fatalf("new user after install error = %v", err)
+		t.Fatalf("new user error = %v", err)
 	}
 	if !observation.loaded || observation.user != "new-user" {
-		t.Fatalf("new user after install = %+v", observation)
+		t.Fatalf("new user = %+v", observation)
 	}
 
-	_, err = service.PrepareUsers(
-		[]string{"first", "second"},
-		[]string{newUUID, newUUID},
-		[]string{"", ""},
-	)
-	if err == nil {
-		t.Fatal("PrepareUsers accepted duplicate UUID credentials")
-	}
-	if strings.Contains(err.Error(), newUUID) {
-		t.Fatalf("duplicate UUID error leaked credential: %v", err)
-	}
+	// Mismatched list lengths leave the published state untouched.
+	service.UpdateUsers([]string{"first", "second"}, []string{newUUID}, []string{""})
 	observation, err = authenticateService(service, handler, newUUID, "")
 	if err != nil {
-		t.Fatalf("failed prepare changed published state: %v", err)
+		t.Fatalf("rejected update changed published state: %v", err)
 	}
 	if observation.user != "new-user" {
-		t.Fatalf("failed prepare published user = %q", observation.user)
+		t.Fatalf("rejected update published user = %q", observation.user)
 	}
 }
 
@@ -189,23 +163,7 @@ func TestServiceConcurrentAuthenticationAndPublication(t *testing.T) {
 	service, handler := newServiceTest(t)
 	const sharedUUID = "33333333-3333-4333-8333-333333333333"
 
-	plainUsers, err := service.PrepareUsers(
-		[]string{"plain-user"},
-		[]string{sharedUUID},
-		[]string{""},
-	)
-	if err != nil {
-		t.Fatalf("PrepareUsers(plain) error = %v", err)
-	}
-	_, err = service.PrepareUsers(
-		[]string{"vision-user"},
-		[]string{sharedUUID},
-		[]string{FlowVision},
-	)
-	if err != nil {
-		t.Fatalf("PrepareUsers(vision) error = %v", err)
-	}
-	service.InstallUsers(plainUsers)
+	service.UpdateUsers([]string{"plain-user"}, []string{sharedUUID}, []string{""})
 
 	stop := make(chan struct{})
 	var updateGroup sync.WaitGroup

@@ -316,7 +316,7 @@ func echoServiceConnection(conn net.Conn, payload string) error {
 	return conn.SetDeadline(time.Time{})
 }
 
-func TestServicePreparedUsersPublishAtomically(t *testing.T) {
+func TestServiceUpdateUsersPublishAtomically(t *testing.T) {
 	t.Parallel()
 
 	harness := newServiceTestHarness(
@@ -325,16 +325,8 @@ func TestServicePreparedUsersPublishAtomically(t *testing.T) {
 		[]string{serviceUUIDOld},
 		[]int{0},
 	)
-	prepared, err := harness.service.PrepareUsers(
-		[]string{"alice"},
-		[]string{serviceUUIDNew},
-		[]int{0},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	oldConn, err := harness.open(serviceUUIDOld, 0, "alice", "old-before-install")
+	oldConn, err := harness.open(serviceUUIDOld, 0, "alice", "old-before-update")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,9 +334,15 @@ func TestServicePreparedUsersPublishAtomically(t *testing.T) {
 	_ = oldConn.Close()
 	harness.requireRejected(t, serviceUUIDNew, 0, "alice")
 
-	harness.service.InstallUsers(prepared)
+	if err = harness.service.UpdateUsers(
+		[]string{"alice"},
+		[]string{serviceUUIDNew},
+		[]int{0},
+	); err != nil {
+		t.Fatal(err)
+	}
 	harness.requireRejected(t, serviceUUIDOld, 0, "alice")
-	newConn, err := harness.open(serviceUUIDNew, 0, "alice", "new-after-install")
+	newConn, err := harness.open(serviceUUIDNew, 0, "alice", "new-after-update")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,30 +351,32 @@ func TestServicePreparedUsersPublishAtomically(t *testing.T) {
 	harness.requireNoFailures(t)
 }
 
-func TestServicePrepareUsersValidation(t *testing.T) {
+func TestServiceUpdateUsersValidation(t *testing.T) {
 	t.Parallel()
 
 	service := NewService[string](nil)
-	if _, err := service.PrepareUsers([]string{"alice"}, nil, []int{0}); err == nil {
-		t.Fatal("PrepareUsers accepted mismatched user lists")
+	err := service.UpdateUsers([]string{"alice"}, nil, []int{0})
+	if err == nil {
+		t.Fatal("UpdateUsers accepted mismatched user lists")
+	} else if strings.Contains(err.Error(), serviceUUIDOld) {
+		t.Fatalf("length error leaked UUID credential: %v", err)
 	}
-	if _, err := service.PrepareUsers(
+
+	// Upstream parity: duplicate credentials and non-positive alter IDs are
+	// accepted here; sing-box rejects them before the transaction commits.
+	if err = service.UpdateUsers(
 		[]string{"alice", "bob"},
 		[]string{serviceUUIDOld, serviceUUIDOld},
-		[]int{0, 0},
-	); err == nil {
-		t.Fatal("PrepareUsers accepted duplicate UUID credentials")
-	} else if strings.Contains(err.Error(), serviceUUIDOld) {
-		t.Fatalf("duplicate error leaked UUID credential: %v", err)
+		[]int{0, -1},
+	); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := service.PrepareUsers(
-		[]string{"alice"},
-		[]string{serviceUUIDOld},
-		[]int{-1},
-	); err == nil {
-		t.Fatal("PrepareUsers accepted a negative alter ID")
-	} else if strings.Contains(err.Error(), serviceUUIDOld) {
-		t.Fatalf("alter ID error leaked UUID credential: %v", err)
+	state := service.state.Load()
+	if len(state.users) != 2 {
+		t.Fatalf("published user count = %d, want 2", len(state.users))
+	}
+	if state.hasAlterIDs {
+		t.Fatal("non-positive alter ID produced legacy alter-ID state")
 	}
 }
 
@@ -389,21 +389,19 @@ func TestServiceConcurrentPublicationUsesOneState(t *testing.T) {
 		[]string{serviceUUIDSwapOne, serviceUUIDSwapTwo},
 		[]int{0, 0},
 	)
-	stateA, err := harness.service.PrepareUsers(
-		[]string{"alice", "bob"},
-		[]string{serviceUUIDSwapOne, serviceUUIDSwapTwo},
-		[]int{0, 0},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stateB, err := harness.service.PrepareUsers(
-		[]string{"bob", "alice"},
-		[]string{serviceUUIDSwapOne, serviceUUIDSwapTwo},
-		[]int{0, 0},
-	)
-	if err != nil {
-		t.Fatal(err)
+	updateSwapped := func(swapped bool) {
+		t.Helper()
+		users := []string{"alice", "bob"}
+		if swapped {
+			users = []string{"bob", "alice"}
+		}
+		if err := harness.service.UpdateUsers(
+			users,
+			[]string{serviceUUIDSwapOne, serviceUUIDSwapTwo},
+			[]int{0, 0},
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	const workerCount = 6
@@ -438,11 +436,7 @@ func TestServiceConcurrentPublicationUsesOneState(t *testing.T) {
 
 	close(start)
 	for updateIndex := range 64 {
-		if updateIndex%2 == 0 {
-			harness.service.InstallUsers(stateB)
-		} else {
-			harness.service.InstallUsers(stateA)
-		}
+		updateSwapped(updateIndex%2 == 0)
 		time.Sleep(time.Millisecond)
 	}
 	workers.Wait()
@@ -478,16 +472,14 @@ func TestServiceAlterIDRefreshLifecycleAndStaleCAS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	withAlterID, err := service.PrepareUsers(
+	if err := service.UpdateUsers(
 		[]string{"legacy"},
 		[]string{serviceUUIDOld},
 		[]int{1},
-	)
-	if err != nil {
+	); err != nil {
 		t.Fatal(err)
 	}
-	service.InstallUsers(withAlterID)
-	installedAlterState := withAlterID.state
+	installedAlterState := service.state.Load()
 	deadline := time.Now().Add(time.Second)
 	for service.state.Load() == installedAlterState && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -500,16 +492,14 @@ func TestServiceAlterIDRefreshLifecycleAndStaleCAS(t *testing.T) {
 		t.Fatal("alter-ID refresh dropped alter-ID source data")
 	}
 
-	withoutAlterID, err := service.PrepareUsers(
+	if err := service.UpdateUsers(
 		[]string{"modern"},
 		[]string{serviceUUIDNew},
 		[]int{0},
-	)
-	if err != nil {
+	); err != nil {
 		t.Fatal(err)
 	}
-	service.InstallUsers(withoutAlterID)
-	installedModernState := withoutAlterID.state
+	installedModernState := service.state.Load()
 	if service.refreshLegacyKeysFrom(refreshedAlterState, time.Now().Unix()+1) {
 		t.Fatal("stale alter-ID refresh overwrote a newer user state")
 	}

@@ -30,10 +30,6 @@ type userState[T comparable] struct {
 	userMap map[[16]byte]userEntry[T]
 }
 
-type PreparedUsers[T comparable] struct {
-	state *userState[T]
-}
-
 type Service[T comparable] struct {
 	users   atomic.Pointer[userState[T]]
 	logger  logger.Logger
@@ -94,44 +90,22 @@ func (s *Service[T]) Close() error {
 	return common.Close(s.decryption)
 }
 
-func (s *Service[T]) PrepareUsers(userList []T, userUUIDList []string, userFlowList []string) (*PreparedUsers[T], error) {
+// UpdateUsers compiles one complete immutable authentication state and publishes
+// it with a single atomic store, so concurrent handshakes never observe a
+// partially applied user set. Mismatched list lengths leave the published state
+// untouched.
+func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowList []string) {
 	if len(userList) != len(userUUIDList) || len(userList) != len(userFlowList) {
-		return nil, E.New("mismatched VLESS user list lengths")
+		return
 	}
 	userMap := make(map[[16]byte]userEntry[T], len(userList))
 	for index, user := range userList {
-		userFlow := userFlowList[index]
-		switch userFlow {
-		case "", FlowVision:
-		default:
-			return nil, E.New("unsupported VLESS flow at user index ", index)
-		}
-		userUUID := normalizeUserUUID(userUUIDList[index])
-		if _, loaded := userMap[userUUID]; loaded {
-			return nil, E.New("duplicate VLESS UUID credential at user index ", index)
-		}
-		userMap[userUUID] = userEntry[T]{
+		userMap[normalizeUserUUID(userUUIDList[index])] = userEntry[T]{
 			user: user,
-			flow: userFlow,
+			flow: userFlowList[index],
 		}
 	}
-	return &PreparedUsers[T]{
-		state: &userState[T]{
-			userMap: userMap,
-		},
-	}, nil
-}
-
-func (s *Service[T]) InstallUsers(users *PreparedUsers[T]) {
-	s.users.Store(users.state)
-}
-
-func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowList []string) {
-	users, err := s.PrepareUsers(userList, userUUIDList, userFlowList)
-	if err != nil {
-		return
-	}
-	s.InstallUsers(users)
+	s.users.Store(&userState[T]{userMap: userMap})
 }
 
 func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
